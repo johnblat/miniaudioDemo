@@ -223,73 +223,6 @@ game_should_run :: proc() -> bool {
 	return true
 }
 
-
-SDL_Event_Type_Input_State_Transition :: struct {
-    sdl_event_type: sdl3.EventType,
-    from: Input_State,
-    to: Input_State,
-}
-
-Key_State_Input_State_Transition :: struct {
-    on: bool,
-    from: Input_State,
-    to: Input_State,
-}
-
-sdl_event_type_input_state_transitions := [?] SDL_Event_Type_Input_State_Transition {
-    {
-        sdl_event_type = .KEY_DOWN,
-        from = .up,
-        to = .pressed,
-    },
-    {
-        sdl_event_type = .KEY_DOWN,
-        from = .pressed,
-        to = .down,
-    },
-    {
-        sdl_event_type = .KEY_UP,
-        from = .down,
-        to = .released,
-    },
-    {
-        sdl_event_type = .KEY_UP,
-        from = .released,
-        to = .up,
-    },
-    {
-        sdl_event_type = .KEY_UP,
-        from = .pressed,
-    }
-}
-
-key_state_input_state_transitions := [?] Key_State_Input_State_Transition {
-    {
-        on = true,
-        from = .up,
-        to = .pressed,
-    },
-    {
-        on = true,
-        from = .pressed,
-        to = .down,
-    },
-    {
-        on = false,
-        from = .down,
-        to = .released,
-    },
-    {
-        on = false,
-        from = .released,
-        to = .up,
-    },
-    {
-        on = false,
-        from = .pressed,
-    }
-}
-
 render_text :: proc (renderer: ^sdl3.Renderer, x, y, size: f32, r, g, b, a: u8, font: Font, text: string) {
     sdl3.SetTextureColorMod(font.sdl_font_atlas_texture, r, g, b)
     sdl3.SetTextureAlphaMod(font.sdl_font_atlas_texture, a)
@@ -327,7 +260,9 @@ render_text_tprintf :: proc (renderer: ^sdl3.Renderer, x, y, size: f32, r, g, b,
 
 @(export)
 game_update :: proc () {
-    // Platform
+    seconds_in_minute : f32 = 60.0
+    quarter_note_duration := seconds_in_minute / gmem.bpm
+
     sdl_event :sdl3.Event
 
     for sdl3.PollEvent(&sdl_event) {
@@ -341,6 +276,27 @@ game_update :: proc () {
             } else if sdl_event.key.scancode == .RSHIFT {
                 ma.sound_seek_to_pcm_frame(&gmem.ma_sound, 0)
                 ma.sound_start(&gmem.ma_sound)
+            } else if sdl_event.key.scancode == .RIGHT {
+                seconds : f32
+                ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &seconds)
+                curr_quarter_note := seconds / quarter_note_duration
+                next_quarter_note := curr_quarter_note + 1
+                next_quarter_note_timestamp_seconds := next_quarter_note * quarter_note_duration
+                sample_rate :u32
+                ma.data_source_get_data_format(gmem.ma_sound.pDataSource, nil, nil, &sample_rate, nil, 0)
+                frame_index := u64(next_quarter_note_timestamp_seconds * f32(sample_rate))
+                ma.sound_seek_to_pcm_frame(&gmem.ma_sound, frame_index)
+            } else if sdl_event.key.scancode == .LEFT {
+                seconds : f32
+                ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &seconds)
+                curr_quarter_note := seconds / quarter_note_duration
+                prev_quarter_note := curr_quarter_note - 1
+                prev_quarter_note = max(0, prev_quarter_note)
+                next_quarter_note_timestamp_seconds := prev_quarter_note * quarter_note_duration
+                sample_rate :u32
+                ma.data_source_get_data_format(gmem.ma_sound.pDataSource, nil, nil, &sample_rate, nil, 0)
+                frame_index := u64(next_quarter_note_timestamp_seconds * f32(sample_rate))
+                ma.sound_seek_to_pcm_frame(&gmem.ma_sound, frame_index)
             }
         } else if sdl_event.type == .KEY_UP {
 
@@ -355,49 +311,52 @@ game_update :: proc () {
 
     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
     sdl3.RenderClear(gmem.sdl_renderer)
-    font_size : f32 = 50
+
+    font_size : f32 = 32
     line_spacing_scale : f32 = 1
     xpos : f32 = 1
     ypos : f32 = 1
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 100, 0, 0, 255, gmem.fonts[1], "filename: %v", AUDIO_FILENAME)
+    ypos += font_size * line_spacing_scale
+
     seconds : f32
     length : f32
     ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &seconds)
     ma.sound_get_length_in_seconds(&gmem.ma_sound, &length)
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 0, 0, 0, 255, gmem.fonts[1], "seconds: %.4f / %.4f", seconds, length)
     ypos += font_size * line_spacing_scale
+
     curr_pcm_frame : u64
     length_in_pcm_frames : u64
     ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &curr_pcm_frame)
     ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &length_in_pcm_frames)
-    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 10, 10, 10, 255, gmem.fonts[1], "pcm frames: %d / %d", curr_pcm_frame, length_in_pcm_frames)
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 30, 30, 30, 255, gmem.fonts[1], "pcm frames: %d / %d", curr_pcm_frame, length_in_pcm_frames)
+    ypos += font_size * line_spacing_scale
 
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 0, 0, 0, 255, gmem.fonts[0],AUDIO_FILENAME)
-    // ypos += font_size * line_spacing_scale
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 255, 0, 0, 255,gmem.fonts[0], "Test!")
-    // ypos += font_size * line_spacing_scale
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 0, 255, 0, 255,gmem.fonts[0], "Test!")
-    // ypos += font_size * line_spacing_scale
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 0, 0, 255, 255,gmem.fonts[0], "Test!")
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "bpm: %.2f", gmem.bpm)
+    ypos += font_size * line_spacing_scale
 
-    // xpos = 500
-    // ypos = 1
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 0, 0, 0, 255, gmem.fonts[1], "Test!")
-    // ypos += font_size * line_spacing_scale
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 255, 0, 0, 255,gmem.fonts[1], "Test!")
-    // ypos += font_size * line_spacing_scale
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 0, 255, 0, 255,gmem.fonts[1], "Test!")
-    // ypos += font_size * line_spacing_scale
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 0, 0, 255, 255,gmem.fonts[1], "Test!")
+    
+    curr_beat := i32(seconds * (gmem.bpm / seconds_in_minute))
+    total_beats := i32(length * (gmem.bpm / seconds_in_minute))
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 50, 50, 50, 255, gmem.fonts[1], "beats: %d / %d", curr_beat, total_beats)
+    ypos += font_size * line_spacing_scale
 
-    // xpos = 720
-    // ypos = 1
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 0, 0, 0, 255, gmem.fonts[2], "Test!")
-    // ypos += font_size * line_spacing_scale
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 255, 0, 0, 255,gmem.fonts[2], "Test!")
-    // ypos += font_size * line_spacing_scale
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 0, 255, 0, 255,gmem.fonts[2], "Test!")
-    // ypos += font_size * line_spacing_scale
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 0, 0, 255, 255,gmem.fonts[2], "Test!")
+    beats_in_measure : i32 : 4
+    curr_measure := curr_beat / beats_in_measure
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "measure: %d", curr_measure)
+    ypos += font_size * line_spacing_scale
+
+    render_text(gmem.sdl_renderer, xpos, ypos, font_size, 100, 100, 0, 255, gmem.fonts[1], "metronome: ")
+    beat_in_measure := curr_beat %% beats_in_measure
+    for i in 0..<beat_in_measure+1 {
+        spacing : f32 = 10
+        size := font_size
+        beat_x := xpos + 250 + f32(i)*(size + spacing)
+        r := sdl3.FRect{beat_x, ypos, size, size}
+        sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,0,0,255)
+        sdl3.RenderFillRect(gmem.sdl_renderer, &r)
+    }
 
     sdl3.RenderPresent(gmem.sdl_renderer)
     free_all(context.temp_allocator)
