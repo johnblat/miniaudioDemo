@@ -43,17 +43,17 @@ game_memory_size :: proc() -> int {
 
 Input_State :: enum {up, pressed, down, released}
 Input_Command :: enum {play_toggle, force_hot_reload, force_build_and_hot_reload, force_restart, restart_sound}
-Input_App_Key :: enum {Enter, RightShift, F5, F6, F7}
+Input_App_Key :: enum {Enter, LeftShift, RightShift, F5, F6, F7}
 
-INPUT_COMMAND_KEYMAP := [Input_App_Key] Input_Command {
-    .Enter = .play_toggle,
-    .RightShift = .restart_sound,
-    .F5 = .force_build_and_hot_reload,
-    .F6 = .force_hot_reload,
-    .F7 = .force_restart,
-}
+// INPUT_COMMAND_KEYMAP := [Input_App_Key] Input_Command {
+//     .Enter = .play_toggle,
+//     .RightShift = .restart_sound,
+//     .F5 = .force_build_and_hot_reload,
+//     .F6 = .force_hot_reload,
+//     .F7 = .force_restart,
+// }
 
-input_command_state := [Input_Command]Input_State {}
+// input_command_state := [Input_Command]Input_State {}
 
 TTF_CHAR_AT_START : i32 :  32
 TTF_CHAR_AMOUNT : i32 : 95
@@ -110,6 +110,10 @@ font_init :: proc(font: ^Font, filename: string) {
     }
 }
 
+prev_keystate: [^]bool
+keystate: [^]bool
+nb_keys: i32
+
 @(export)
 game_init :: proc () {
     gmem = new(Game_Memory)
@@ -143,6 +147,10 @@ game_init :: proc () {
         fmt.printfln("[miniaudio] sound start failed")
     }
 
+    sdl3.PumpEvents()
+    keystate := sdl3.GetKeyboardState(&nb_keys)
+    prev_keystate = make([^]bool, nb_keys)
+    mem.copy(&prev_keystate[0], &keystate[0], size_of(bool) * int(nb_keys))
     gmem.bpm = 162
 
 }
@@ -158,17 +166,17 @@ game_hot_reloaded :: proc(mem: rawptr) {
 
 @(export)
 game_force_reload :: proc() -> bool {
-    return input_command_state[.force_hot_reload] == .pressed
+    return input_states[.F5]
 }
 
 @(export)
 game_force_build_and_reload :: proc() -> bool {
-    return input_command_state[.force_build_and_hot_reload] == .pressed
+    return input_states[.F6]
 }
 
 @(export)
 game_force_restart :: proc() -> bool {
-    return input_command_state[.force_restart] == .pressed
+    return input_states[.F7]
 }
 
 track: mem.Tracking_Allocator
@@ -258,6 +266,21 @@ render_text_tprintf :: proc (renderer: ^sdl3.Renderer, x, y, size: f32, r, g, b,
     render_text(renderer, x, y, size, r, g, b, a, font, text)
 }
 
+input_states := [Input_App_Key]bool{}
+prev_input_states := [Input_App_Key]bool{}
+
+ma_seek_quarter_notes :: proc (quarter_note_duration, nb_quarter_notes: f32) {
+    seconds : f32
+    ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &seconds)
+    curr_quarter_note := seconds / quarter_note_duration
+    seek_quarter_note := curr_quarter_note + nb_quarter_notes
+    seek_quarter_note_timestamp_seconds := seek_quarter_note * quarter_note_duration
+    sample_rate :u32
+    ma.data_source_get_data_format(gmem.ma_sound.pDataSource, nil, nil, &sample_rate, nil, 0)
+    frame_index := u64(seek_quarter_note_timestamp_seconds * f32(sample_rate))
+    ma.sound_seek_to_pcm_frame(&gmem.ma_sound, frame_index)
+}
+
 @(export)
 game_update :: proc () {
     seconds_in_minute : f32 = 60.0
@@ -265,18 +288,23 @@ game_update :: proc () {
 
     sdl_event :sdl3.Event
 
+    mem.copy(&prev_input_states, &input_states, size_of(input_states))
+
     for sdl3.PollEvent(&sdl_event) {
         if sdl_event.type == .KEY_DOWN {
+
             if sdl_event.key.scancode == .RETURN {
-                if ma.sound_is_playing(&gmem.ma_sound) {
-                    ma.sound_stop(&gmem.ma_sound)
-                } else {
-                    ma.sound_start(&gmem.ma_sound)
-                }
-            } else if sdl_event.key.scancode == .RSHIFT {
+                input_states[.Enter] = true
+            } else if sdl_event.key.scancode == .LSHIFT {
+                input_states[.LeftShift] = true
+            }
+            else if sdl_event.key.scancode == .RSHIFT
+            {
                 ma.sound_seek_to_pcm_frame(&gmem.ma_sound, 0)
                 ma.sound_start(&gmem.ma_sound)
-            } else if sdl_event.key.scancode == .RIGHT {
+            }
+            else if sdl_event.key.scancode == .RIGHT && !input_states[.LeftShift]
+            {
                 seconds : f32
                 ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &seconds)
                 curr_quarter_note := seconds / quarter_note_duration
@@ -286,7 +314,9 @@ game_update :: proc () {
                 ma.data_source_get_data_format(gmem.ma_sound.pDataSource, nil, nil, &sample_rate, nil, 0)
                 frame_index := u64(next_quarter_note_timestamp_seconds * f32(sample_rate))
                 ma.sound_seek_to_pcm_frame(&gmem.ma_sound, frame_index)
-            } else if sdl_event.key.scancode == .LEFT {
+            }
+            else if sdl_event.key.scancode == .LEFT && !input_states[.LeftShift]
+            {
                 seconds : f32
                 ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &seconds)
                 curr_quarter_note := seconds / quarter_note_duration
@@ -298,8 +328,25 @@ game_update :: proc () {
                 frame_index := u64(next_quarter_note_timestamp_seconds * f32(sample_rate))
                 ma.sound_seek_to_pcm_frame(&gmem.ma_sound, frame_index)
             }
-        } else if sdl_event.type == .KEY_UP {
 
+            if sdl_event.key.scancode == .RIGHT && input_states[.LeftShift] {
+                seconds : f32
+                ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &seconds)
+                measure_duration := quarter_note_duration * 4.0
+                curr_measure := (seconds / measure_duration)
+                next_measure := curr_measure + 1
+                next_quarter_note_timestamp_seconds := f32(next_measure) * measure_duration
+                sample_rate :u32
+                ma.data_source_get_data_format(gmem.ma_sound.pDataSource, nil, nil, &sample_rate, nil, 0)
+                frame_index := u64(next_quarter_note_timestamp_seconds * f32(sample_rate))
+                ma.sound_seek_to_pcm_frame(&gmem.ma_sound, frame_index)
+            }
+        } else if sdl_event.type == .KEY_UP {
+            if sdl_event.key.scancode == .RETURN {
+                input_states[.Enter] = false
+            } else if sdl_event.key.scancode == .LSHIFT {
+                input_states[.LeftShift] = false
+            }
         }
 
         if sdl_event.type == .WINDOW_CLOSE_REQUESTED {
@@ -309,7 +356,19 @@ game_update :: proc () {
     }
 
 
-    sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
+    is_return_key_down := input_states[.Enter] == true
+    is_return_key_down_last_frame := prev_input_states[.Enter] == true
+    is_return_key_pressed := is_return_key_down && !is_return_key_down_last_frame
+    if is_return_key_pressed {
+        if ma.sound_is_playing(&gmem.ma_sound) {
+            ma.sound_stop(&gmem.ma_sound)
+        } else {
+            ma.sound_start(&gmem.ma_sound)
+        }
+    }
+
+
+    sdl3.SetRenderDrawColor(gmem.sdl_renderer, 120, 100, 0, 255)
     sdl3.RenderClear(gmem.sdl_renderer)
 
     font_size : f32 = 32
@@ -347,7 +406,7 @@ game_update :: proc () {
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "measure: %d", curr_measure)
     ypos += font_size * line_spacing_scale
 
-    render_text(gmem.sdl_renderer, xpos, ypos, font_size, 100, 100, 0, 255, gmem.fonts[1], "metronome: ")
+    render_text(gmem.sdl_renderer, xpos, ypos, font_size, 200, 200, 0, 255, gmem.fonts[1], "metronome: ")
     beat_in_measure := curr_beat %% beats_in_measure
     for i in 0..<beat_in_measure+1 {
         spacing : f32 = 10
@@ -360,5 +419,5 @@ game_update :: proc () {
 
     sdl3.RenderPresent(gmem.sdl_renderer)
     free_all(context.temp_allocator)
-    sdl3.Delay(16)
+    sdl3.Delay(u32(1/60))
 }

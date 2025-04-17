@@ -86,7 +86,8 @@ load_game_api :: proc(api_version: int) -> (api: Game_API, ok: bool) {
 
 unload_game_api :: proc(api: ^Game_API) {
 	if api.lib != nil {
-		if !dynlib.unload_library(api.lib) {
+		ok := dynlib.unload_library(api.lib)
+		if !ok {
 			fmt.printfln("Failed unloading lib: {0}", dynlib.last_error())
 		}
 	}
@@ -231,6 +232,7 @@ main :: proc() {
 	}
 
 	for &g in old_game_apis {
+		// FIXME(johnb): This breaks when there are any old game apis
 		unload_game_api(&g)
 	}
 
@@ -238,7 +240,7 @@ main :: proc() {
 
 	game_api.shutdown_window()
 	// TODO(johnb): this broke for some reason
-	// unload_game_api(&game_api)
+	unload_game_api(&game_api)
 	// mem.tracking_allocator_destroy(&tracking_allocator)
 }
 
