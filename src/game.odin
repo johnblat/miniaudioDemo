@@ -166,17 +166,17 @@ game_hot_reloaded :: proc(mem: rawptr) {
 
 @(export)
 game_force_reload :: proc() -> bool {
-    return input_states[.F5]
+    return input_app_keys_is_down[.F5]
 }
 
 @(export)
 game_force_build_and_reload :: proc() -> bool {
-    return input_states[.F6]
+    return input_app_keys_is_down[.F6]
 }
 
 @(export)
 game_force_restart :: proc() -> bool {
-    return input_states[.F7]
+    return input_app_keys_is_down[.F7]
 }
 
 track: mem.Tracking_Allocator
@@ -266,8 +266,8 @@ render_text_tprintf :: proc (renderer: ^sdl3.Renderer, x, y, size: f32, r, g, b,
     render_text(renderer, x, y, size, r, g, b, a, font, text)
 }
 
-input_states := [Input_App_Key]bool{}
-prev_input_states := [Input_App_Key]bool{}
+input_app_keys_is_down := [Input_App_Key]bool{}
+prev_input_app_keys_is_down := [Input_App_Key]bool{}
 
 ma_seek_quarter_notes :: proc (quarter_note_duration, nb_quarter_notes: f32) {
     seconds : f32
@@ -288,64 +288,43 @@ game_update :: proc () {
 
     sdl_event :sdl3.Event
 
-    mem.copy(&prev_input_states, &input_states, size_of(input_states))
+    mem.copy(&prev_input_app_keys_is_down, &input_app_keys_is_down, size_of(input_app_keys_is_down))
 
     for sdl3.PollEvent(&sdl_event) {
         if sdl_event.type == .KEY_DOWN {
-
+            // Note(jb1t): Why mix sdl events and my input_app_keys_is_down code? Why not just use one or the other?
+            // If a user is holding a key, SDL will keep sending KEYDOWN events after like half a second. This is common
+            // for things like text editing. In this app, when seeking forwards and backwards, i want that behavior.
+            // Since SDL already does that, i use it in addition to code i have for tracking if an input is already down
+            // That way we can have key chord type shortcuts WITH the sdl behavior
             if sdl_event.key.scancode == .RETURN {
-                input_states[.Enter] = true
+                input_app_keys_is_down[.Enter] = true
             } else if sdl_event.key.scancode == .LSHIFT {
-                input_states[.LeftShift] = true
+                input_app_keys_is_down[.LeftShift] = true
             }
-            else if sdl_event.key.scancode == .RSHIFT
-            {
+            else if sdl_event.key.scancode == .RSHIFT {
                 ma.sound_seek_to_pcm_frame(&gmem.ma_sound, 0)
                 ma.sound_start(&gmem.ma_sound)
             }
-            else if sdl_event.key.scancode == .RIGHT && !input_states[.LeftShift]
-            {
-                seconds : f32
-                ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &seconds)
-                curr_quarter_note := seconds / quarter_note_duration
-                next_quarter_note := curr_quarter_note + 1
-                next_quarter_note_timestamp_seconds := next_quarter_note * quarter_note_duration
-                sample_rate :u32
-                ma.data_source_get_data_format(gmem.ma_sound.pDataSource, nil, nil, &sample_rate, nil, 0)
-                frame_index := u64(next_quarter_note_timestamp_seconds * f32(sample_rate))
-                ma.sound_seek_to_pcm_frame(&gmem.ma_sound, frame_index)
+            else if sdl_event.key.scancode == .RIGHT && !input_app_keys_is_down[.LeftShift] {
+                ma_seek_quarter_notes(quarter_note_duration, 1.0)
             }
-            else if sdl_event.key.scancode == .LEFT && !input_states[.LeftShift]
-            {
-                seconds : f32
-                ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &seconds)
-                curr_quarter_note := seconds / quarter_note_duration
-                prev_quarter_note := curr_quarter_note - 1
-                prev_quarter_note = max(0, prev_quarter_note)
-                next_quarter_note_timestamp_seconds := prev_quarter_note * quarter_note_duration
-                sample_rate :u32
-                ma.data_source_get_data_format(gmem.ma_sound.pDataSource, nil, nil, &sample_rate, nil, 0)
-                frame_index := u64(next_quarter_note_timestamp_seconds * f32(sample_rate))
-                ma.sound_seek_to_pcm_frame(&gmem.ma_sound, frame_index)
+            else if sdl_event.key.scancode == .LEFT && !input_app_keys_is_down[.LeftShift] {
+                ma_seek_quarter_notes(quarter_note_duration, -1.0)
             }
 
-            if sdl_event.key.scancode == .RIGHT && input_states[.LeftShift] {
-                seconds : f32
-                ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &seconds)
-                measure_duration := quarter_note_duration * 4.0
-                curr_measure := (seconds / measure_duration)
-                next_measure := curr_measure + 1
-                next_quarter_note_timestamp_seconds := f32(next_measure) * measure_duration
-                sample_rate :u32
-                ma.data_source_get_data_format(gmem.ma_sound.pDataSource, nil, nil, &sample_rate, nil, 0)
-                frame_index := u64(next_quarter_note_timestamp_seconds * f32(sample_rate))
-                ma.sound_seek_to_pcm_frame(&gmem.ma_sound, frame_index)
+            if sdl_event.key.scancode == .RIGHT && input_app_keys_is_down[.LeftShift] {
+                ma_seek_quarter_notes(quarter_note_duration, 4.0)
             }
-        } else if sdl_event.type == .KEY_UP {
+            else if sdl_event.key.scancode == .LEFT && input_app_keys_is_down[.LeftShift] {
+                ma_seek_quarter_notes(quarter_note_duration, -4.0)
+            }
+        }
+        else if sdl_event.type == .KEY_UP {
             if sdl_event.key.scancode == .RETURN {
-                input_states[.Enter] = false
+                input_app_keys_is_down[.Enter] = false
             } else if sdl_event.key.scancode == .LSHIFT {
-                input_states[.LeftShift] = false
+                input_app_keys_is_down[.LeftShift] = false
             }
         }
 
@@ -356,8 +335,8 @@ game_update :: proc () {
     }
 
 
-    is_return_key_down := input_states[.Enter] == true
-    is_return_key_down_last_frame := prev_input_states[.Enter] == true
+    is_return_key_down := input_app_keys_is_down[.Enter] == true
+    is_return_key_down_last_frame := prev_input_app_keys_is_down[.Enter] == true
     is_return_key_pressed := is_return_key_down && !is_return_key_down_last_frame
     if is_return_key_pressed {
         if ma.sound_is_playing(&gmem.ma_sound) {
@@ -395,7 +374,7 @@ game_update :: proc () {
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "bpm: %.2f", gmem.bpm)
     ypos += font_size * line_spacing_scale
 
-    
+
     curr_beat := i32(seconds * (gmem.bpm / seconds_in_minute))
     total_beats := i32(length * (gmem.bpm / seconds_in_minute))
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 50, 50, 50, 255, gmem.fonts[1], "beats: %d / %d", curr_beat, total_beats)
