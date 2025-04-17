@@ -110,16 +110,15 @@ font_init :: proc(font: ^Font, filename: string) {
     }
 }
 
-prev_keystate: [^]bool
-keystate: [^]bool
-nb_keys: i32
+screen_width : i32 = 1280
+screen_height : i32 = 720
 
 @(export)
 game_init :: proc () {
     gmem = new(Game_Memory)
 
 
-    sdl_init_ok := sdl3.CreateWindowAndRenderer("MiniAudio Demo", 1280, 720, {}, &gmem.sdl_window, &gmem.sdl_renderer)
+    sdl_init_ok := sdl3.CreateWindowAndRenderer("MiniAudio Demo", screen_width, screen_height, {}, &gmem.sdl_window, &gmem.sdl_renderer)
     if !sdl_init_ok {
         fmt.printfln("[SDL3] Window and renderer failed to init")
         os2.exit(1)
@@ -146,11 +145,6 @@ game_init :: proc () {
     if sound_start_result != .SUCCESS {
         fmt.printfln("[miniaudio] sound start failed")
     }
-
-    sdl3.PumpEvents()
-    keystate := sdl3.GetKeyboardState(&nb_keys)
-    prev_keystate = make([^]bool, nb_keys)
-    mem.copy(&prev_keystate[0], &keystate[0], size_of(bool) * int(nb_keys))
     gmem.bpm = 162
 
 }
@@ -351,7 +345,7 @@ game_update :: proc () {
     sdl3.RenderClear(gmem.sdl_renderer)
 
     font_size : f32 = 32
-    line_spacing_scale : f32 = 1
+    line_spacing_scale : f32 = 1.1
     xpos : f32 = 1
     ypos : f32 = 1
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 100, 0, 0, 255, gmem.fonts[1], "filename: %v", AUDIO_FILENAME)
@@ -394,6 +388,37 @@ game_update :: proc () {
         r := sdl3.FRect{beat_x, ypos, size, size}
         sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,0,0,255)
         sdl3.RenderFillRect(gmem.sdl_renderer, &r)
+    }
+    top_padding_for_progress_bar : f32 = 10.0
+    ypos += font_size * line_spacing_scale + top_padding_for_progress_bar
+
+    { // progress bar
+        padding_for_progress_bar : f32 = 50.0
+
+        progress_bar_width := f32(screen_width) - (padding_for_progress_bar * 2.0)
+        progress_bar_height : f32 = 33
+
+        curr_time_in_sound_seconds : f32
+        sound_length_seconds : f32
+        ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &curr_time_in_sound_seconds)
+        ma.sound_get_length_in_seconds(&gmem.ma_sound, &sound_length_seconds)
+        progress_scalar := curr_time_in_sound_seconds / sound_length_seconds
+
+        past_progress_width := progress_bar_width * progress_scalar
+
+        future_progress_width := progress_bar_width - past_progress_width
+
+        progress_bar_xpos := xpos + padding_for_progress_bar
+        future_progress_xpos := progress_bar_xpos + past_progress_width
+
+        past_progress_bar_rectangle := sdl3.FRect{progress_bar_xpos, ypos, past_progress_width, progress_bar_height}
+        future_progress_bar_rectangle := sdl3.FRect{future_progress_xpos, ypos, future_progress_width, progress_bar_height}
+
+        sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,0,0,255)
+        sdl3.RenderFillRect(gmem.sdl_renderer, &past_progress_bar_rectangle)
+
+        sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
+        sdl3.RenderFillRect(gmem.sdl_renderer, &future_progress_bar_rectangle)
     }
 
     sdl3.RenderPresent(gmem.sdl_renderer)
