@@ -6,9 +6,11 @@ import "core:strings"
 import "core:strconv"
 import "core:os/os2"
 import "core:mem"
+import "core:math"
 import sdl3 "vendor:sdl3"
 import ma "vendor:miniaudio"
 import ttf "vendor:stb/truetype"
+import img "vendor:stb/image"
 
 breakpoint :: intrinsics.debug_trap
 
@@ -21,6 +23,7 @@ Game_Memory :: struct {
     fonts :[3]Font,
     sdl_renderer: ^sdl3.Renderer,
     sdl_window: ^sdl3.Window,
+    animated_sprite_atlas: ^sdl3.Texture,
 }
 
 Font :: struct {
@@ -113,6 +116,52 @@ font_init :: proc(font: ^Font, filename: string) {
 screen_width : i32 = 1280
 screen_height : i32 = 720
 
+media_player_buttons_sprite_width : f32 = 34
+media_player_buttons_sprite_height : f32 = 33
+
+Frame_Animation :: struct {
+    frame_rate: f32,
+    curr_frame: i32,
+    ping_pong: bool,
+    nb_frames: i32,
+    timer: f32,
+}
+
+SpriteRow :: enum {play, pause, playhead, loop_on, loop_off}
+
+animated_sprites := [SpriteRow]Frame_Animation {
+    .play = {
+        frame_rate = 7,
+        nb_frames = 6,
+    },
+    .pause = {
+        frame_rate = 7,
+        nb_frames = 6,
+    },
+    .playhead = {
+        frame_rate = 7,
+        nb_frames = 3,
+        ping_pong = true,
+    },
+    .loop_on = {
+        frame_rate = 7,
+        nb_frames = 6,
+    },
+    .loop_off = {
+        frame_rate = 7,
+        nb_frames = 8,
+        ping_pong = true,
+    },
+
+}
+
+sprite_atlas_src_rect_clip :: proc (texture: ^sdl3.Texture, row, col: i32, frame_width, frame_height: f32) -> sdl3.FRect {
+    y := math.floor(f32(row) * frame_height)
+    x := f32(col) * frame_width
+    src := sdl3.FRect{x, y, frame_width, frame_height}
+    return src
+}
+
 @(export)
 game_init :: proc () {
     gmem = new(Game_Memory)
@@ -147,6 +196,13 @@ game_init :: proc () {
     }
     gmem.bpm = 162
 
+    x, y, channels_in_file: i32
+    img_bytes := img.load("assets/MediaPlayerButtons.png", &x, &y, &channels_in_file, 4)
+    surface := sdl3.CreateSurfaceFrom(x, y, .RGBA32, &img_bytes[0], x*channels_in_file)
+    gmem.animated_sprite_atlas = sdl3.CreateTextureFromSurface(gmem.sdl_renderer, surface)
+
+    img.image_free(&img_bytes[0])
+    sdl3.DestroySurface(surface)
 }
 
 @(export)
@@ -313,6 +369,11 @@ game_update :: proc () {
             else if sdl_event.key.scancode == .LEFT && input_app_keys_is_down[.LeftShift] {
                 ma_seek_quarter_notes(quarter_note_duration, -4.0)
             }
+
+            if sdl_event.key.scancode == .L {
+                is_looping := ma.sound_is_looping(&gmem.ma_sound)
+                ma.sound_set_looping(&gmem.ma_sound, !is_looping)
+            }
         }
         else if sdl_event.type == .KEY_UP {
             if sdl_event.key.scancode == .RETURN {
@@ -344,7 +405,7 @@ game_update :: proc () {
     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 120, 100, 0, 255)
     sdl3.RenderClear(gmem.sdl_renderer)
 
-    font_size : f32 = 32
+    font_size : f32 = 22
     line_spacing_scale : f32 = 1.1
     xpos : f32 = 1
     ypos : f32 = 1
@@ -393,19 +454,18 @@ game_update :: proc () {
     ypos += font_size * line_spacing_scale + top_padding_for_progress_bar
 
     { // progress bar
-        padding_for_progress_bar : f32 = 50.0
+        padding_for_progress_bar : f32 = 100.0
 
         progress_bar_width := f32(screen_width) - (padding_for_progress_bar * 2.0)
-        progress_bar_height : f32 = 33
+        progress_bar_height : f32 = 27
 
         curr_time_in_sound_seconds : f32
         sound_length_seconds : f32
         ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &curr_time_in_sound_seconds)
         ma.sound_get_length_in_seconds(&gmem.ma_sound, &sound_length_seconds)
+
         progress_scalar := curr_time_in_sound_seconds / sound_length_seconds
-
         past_progress_width := progress_bar_width * progress_scalar
-
         future_progress_width := progress_bar_width - past_progress_width
 
         progress_bar_xpos := xpos + padding_for_progress_bar
@@ -419,9 +479,81 @@ game_update :: proc () {
 
         sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
         sdl3.RenderFillRect(gmem.sdl_renderer, &future_progress_bar_rectangle)
+
+        // playhead_sprite := animated_sprites[.playhead]
+        playhead_sprite_dst := sdl3.FRect{
+            future_progress_xpos - (media_player_buttons_sprite_width/2.0),
+            ypos - 3,
+            media_player_buttons_sprite_width,
+            media_player_buttons_sprite_height,
+        }
+        playhead_sprite_src := sprite_atlas_src_rect_clip(gmem.animated_sprite_atlas, i32(SpriteRow.playhead), animated_sprites[.playhead].curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height)
+        sdl3.RenderTexture(gmem.sdl_renderer, gmem.animated_sprite_atlas, &playhead_sprite_src, &playhead_sprite_dst)
+
+        if ma.sound_is_playing(&gmem.ma_sound) {
+            play_sprite_dst := sdl3.FRect{ 10.0, ypos, media_player_buttons_sprite_width, media_player_buttons_sprite_height }
+            play_sprite_src := sprite_atlas_src_rect_clip(gmem.animated_sprite_atlas, i32(SpriteRow.play), animated_sprites[.play].curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height)
+            sdl3.RenderTexture(gmem.sdl_renderer, gmem.animated_sprite_atlas, &play_sprite_src, &play_sprite_dst)
+        } else {
+            pause_sprite_dst := sdl3.FRect{ 10.0, ypos, media_player_buttons_sprite_width, media_player_buttons_sprite_height }
+            pause_sprite_src := sprite_atlas_src_rect_clip(gmem.animated_sprite_atlas, i32(SpriteRow.pause), animated_sprites[.pause].curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height)
+            sdl3.RenderTexture(gmem.sdl_renderer, gmem.animated_sprite_atlas, &pause_sprite_src, &pause_sprite_dst)
+        }
+
+        if ma.sound_is_looping(&gmem.ma_sound) {
+            loop_on_sprite_dst_i := sdl3.Rect{
+                i32(progress_bar_xpos + progress_bar_width + 10.0),
+                i32(ypos), i32(media_player_buttons_sprite_width), i32(media_player_buttons_sprite_height)
+            }
+
+            loop_on_sprite_dst := sdl3.FRect{
+                progress_bar_xpos + progress_bar_width + 10.0,
+                ypos, media_player_buttons_sprite_width, media_player_buttons_sprite_height }
+            loop_on_sprite_src := sprite_atlas_src_rect_clip(gmem.animated_sprite_atlas, i32(SpriteRow.loop_on), animated_sprites[.loop_on].curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height)
+            loop_on_sprite_src_i := sdl3.Rect{i32(loop_on_sprite_src.x), i32(loop_on_sprite_src.y), i32(loop_on_sprite_src.w), i32(loop_on_sprite_src.h)}
+            sdl3.RenderTexture(gmem.sdl_renderer, gmem.animated_sprite_atlas, &loop_on_sprite_src, &loop_on_sprite_dst)
+        } else {
+            loop_off_sprite_dst := sdl3.FRect{
+                progress_bar_xpos + progress_bar_width + 10.0,
+                ypos, media_player_buttons_sprite_width, media_player_buttons_sprite_height }
+            loop_off_sprite_src := sprite_atlas_src_rect_clip(gmem.animated_sprite_atlas, i32(SpriteRow.loop_off), animated_sprites[.loop_off].curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height)
+            sdl3.RenderTexture(gmem.sdl_renderer, gmem.animated_sprite_atlas, &loop_off_sprite_src, &loop_off_sprite_dst)
+        }
+        ypos += progress_bar_height + padding_for_progress_bar
+    }
+
+    { // animated sprites
+        for &animated_sprite in animated_sprites {
+            animated_sprite.timer += f32(1.0/60.0)
+            frame_duration_seconds : f32 = 1.0 / animated_sprite.frame_rate
+            total_duration_seconds := frame_duration_seconds * f32(animated_sprite.nb_frames)
+            nb_frames := animated_sprite.nb_frames
+            if animated_sprite.ping_pong {
+                total_duration_seconds *= 2
+                nb_frames *= 2
+            }
+            if animated_sprite.timer >= total_duration_seconds {
+                animated_sprite.timer = 0.0
+            }
+            curr_frame := i32(math.floor(animated_sprite.timer / frame_duration_seconds)) %% (nb_frames)
+            if curr_frame >= animated_sprite.nb_frames {
+                animated_sprite.curr_frame = (animated_sprite.nb_frames-1) - (curr_frame - animated_sprite.nb_frames)
+            } else {
+                animated_sprite.curr_frame = curr_frame
+            }
+        }
+        width, height: f32
+        sdl3.GetTextureSize(gmem.animated_sprite_atlas, &width, &height)
+        for animated_sprite, sprite_row in animated_sprites {
+            src := sprite_atlas_src_rect_clip(gmem.animated_sprite_atlas, i32(sprite_row), animated_sprite.curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height)
+            dst := sdl3.FRect{xpos + (50.0*f32(sprite_row)), ypos, media_player_buttons_sprite_width * 2.0, media_player_buttons_sprite_height * 2.0}
+            ypos += media_player_buttons_sprite_height + 10.0
+            sdl3.RenderTexture(gmem.sdl_renderer, gmem.animated_sprite_atlas, &src, &dst)
+            sdl3.SetTextureScaleMode(gmem.animated_sprite_atlas, .NEAREST)
+        }
     }
 
     sdl3.RenderPresent(gmem.sdl_renderer)
     free_all(context.temp_allocator)
-    sdl3.Delay(u32(1/60))
+    sdl3.Delay(u32(math.floor(f32(1000.0/60.0))))
 }
