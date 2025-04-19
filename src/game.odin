@@ -1,17 +1,16 @@
 package game
 
 import "base:intrinsics"
+import "core:c"
 import "core:fmt"
-import "core:strings"
-import "core:strconv"
-import "core:os/os2"
-import "core:mem"
 import "core:math"
+import "core:mem"
+import "core:os/os2"
+import "core:strings"
 import sdl3 "vendor:sdl3"
 import ma "vendor:miniaudio"
 import ttf "vendor:stb/truetype"
 import img "vendor:stb/image"
-
 breakpoint :: intrinsics.debug_trap
 
 should_run := true
@@ -19,6 +18,7 @@ should_run := true
 Game_Memory :: struct {
     ma_engine: ma.engine,
     ma_sound :ma.sound,
+    sound_audio_filename: cstring,
     bpm: f32,
     fonts :[3]Font,
     sdl_renderer: ^sdl3.Renderer,
@@ -63,7 +63,6 @@ TTF_CHAR_AMOUNT : i32 : 95
 FONT_TEXTURE_SIDE_SIZE : i32 : 1024
 FONT_TEXTURE_2D_SIZE : i32 : FONT_TEXTURE_SIDE_SIZE * FONT_TEXTURE_SIDE_SIZE
 
-AUDIO_FILENAME :: "ASSETS/UNLIMITED.mp3"
 
 font_init :: proc(font: ^Font, filename: string) {
     font.sdl_font_atlas_texture = sdl3.CreateTexture(gmem.sdl_renderer, .RGBA32, .STATIC, FONT_TEXTURE_SIDE_SIZE, FONT_TEXTURE_SIDE_SIZE)
@@ -184,7 +183,17 @@ game_init :: proc () {
     font_init(&gmem.fonts[1], "assets/joystix monospace.otf")
     font_init(&gmem.fonts[2], "assets/VCR_OSD_MONO.ttf")
 
-    sound_init_result := ma.sound_init_from_file(&gmem.ma_engine, AUDIO_FILENAME, {.DECODE}, nil, nil, &gmem.ma_sound)
+    // default_audio_filename := "C:\\Users\\johnb\\Music\\Full Moon Full Life (FULL VERSION LYRICS) _ Persona 3 Reload.mp3"
+    default_audio_filename := "ASSETS/unlimited.mp3"
+    // Note(johnb): all filenames are allocated with default allocator and then intented to be deleted before replacing
+    // The reason is that currently, only one filename is really active at a time
+    // in the future, i may display a bunch of filenames in the app in a library.
+    // At that point, i will have all of those share the same lifetime.
+    // In the more near future, i may try to pull song details like the track name, artist, or genre since
+    // that is nice to display in a media player
+    gmem.sound_audio_filename = strings.clone_to_cstring(default_audio_filename)
+
+    sound_init_result := ma.sound_init_from_file(&gmem.ma_engine, gmem.sound_audio_filename, {.DECODE}, nil, nil, &gmem.ma_sound)
     if sound_init_result != .SUCCESS {
         fmt.printfln("[miniaudio] sound initialization from file failed")
         os2.exit(1)
@@ -297,7 +306,6 @@ render_text :: proc (renderer: ^sdl3.Renderer, x, y, size: f32, r, g, b, a: u8, 
         if i32(text[i]) >= TTF_CHAR_AT_START && i32(text[i]) < TTF_CHAR_AT_START + TTF_CHAR_AMOUNT + 1 {
             info := font.font_packed_chars[i32(text[i]) - TTF_CHAR_AT_START]
             src := sdl3.FRect{f32(info.x0), f32(info.y0), f32(info.x1) - f32(info.x0), f32(info.y1) - f32(info.y0)}
-            font_scale := font_size / font.font_line_height
             dst := sdl3.FRect{
                 xpos + f32(info.xoff) * font_scale,
                 (ypos + f32(info.yoff) * font_scale) + font_size,
@@ -335,6 +343,35 @@ ma_seek_quarter_notes :: proc (quarter_note_duration, nb_quarter_notes: f32) {
     ma.sound_seek_to_pcm_frame(&gmem.ma_sound, frame_index)
 }
 
+
+file_dialogue_callback :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: c.int) {
+    is_no_file_selected := filelist[0] == nil
+    if is_no_file_selected {
+        return
+    }
+    ma.sound_uninit(&gmem.ma_sound)
+    // Note(jblat): only one file will be in the list
+    result := ma.sound_init_from_file(&gmem.ma_engine, filelist[0], {.DECODE}, nil, nil, &gmem.ma_sound)
+    ma.sound_start(&gmem.ma_sound)
+
+    // TODO(jblat): is this the best way to handle this type of error?
+    context = context
+    if result != .SUCCESS {
+        result_description := ma.result_description(result)
+        fmt.printfln("[miniaudio] sound failed to init from file: %s. result: %s", filelist[0], result_description)
+        str := "audio file failed to load. try another file."
+        delete(gmem.sound_audio_filename)
+        gmem.sound_audio_filename = strings.clone_to_cstring(str)
+        return
+    }
+    delete(gmem.sound_audio_filename)
+    size_filename := len(filelist[0])
+    cstr := make([]byte, size_filename + 1)
+    gmem.sound_audio_filename = cstring(&cstr[0])
+    mem.copy(rawptr(gmem.sound_audio_filename), rawptr(filelist[0]), size_filename)
+}
+
+
 @(export)
 game_update :: proc () {
     seconds_in_minute : f32 = 60.0
@@ -346,7 +383,7 @@ game_update :: proc () {
 
     for sdl3.PollEvent(&sdl_event) {
         if sdl_event.type == .KEY_DOWN {
-            // Note(jb1t): Why mix sdl events and my input_app_keys_is_down code? Why not just use one or the other?
+            // Note(jblat): Why mix sdl events and my input_app_keys_is_down code? Why not just use one or the other?
             // If a user is holding a key, SDL will keep sending KEYDOWN events after like half a second. This is common
             // for things like text editing. In this app, when seeking forwards and backwards, i want that behavior.
             // Since SDL already does that, i use it in addition to code i have for tracking if an input is already down
@@ -374,9 +411,20 @@ game_update :: proc () {
                 ma_seek_quarter_notes(quarter_note_duration, -4.0)
             }
 
-            if sdl_event.key.scancode == .L {
+            is_loop_toggle_button_pressed := sdl_event.key.scancode == .L
+            if is_loop_toggle_button_pressed {
                 is_looping := ma.sound_is_looping(&gmem.ma_sound)
                 ma.sound_set_looping(&gmem.ma_sound, !is_looping)
+            }
+
+            is_open_file_dialogue_button_pressed := sdl_event.key.scancode == .F
+            if is_open_file_dialogue_button_pressed {
+                file_filters := [?]sdl3.DialogFileFilter{
+                    {name = "MP3 File",  pattern = "mp3"},
+                    {name = "WAV File",  pattern = "wav"},
+                    {name = "FLAC File", pattern = "flac"},
+                }
+                sdl3.ShowOpenFileDialog(file_dialogue_callback, nil, gmem.sdl_window, nil, 0, "C:\\Users\\johnb", false)
             }
         }
         else if sdl_event.type == .KEY_UP {
@@ -413,7 +461,7 @@ game_update :: proc () {
     line_spacing_scale : f32 = 1.1
     xpos : f32 = 1
     ypos : f32 = 1
-    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 100, 0, 0, 255, gmem.fonts[1], "filename: %v", AUDIO_FILENAME)
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 100, 0, 0, 255, gmem.fonts[1], "filename: %v", gmem.sound_audio_filename)
     ypos += font_size * line_spacing_scale
 
     seconds : f32
@@ -505,16 +553,11 @@ game_update :: proc () {
         }
 
         if ma.sound_is_looping(&gmem.ma_sound) {
-            loop_on_sprite_dst_i := sdl3.Rect{
-                i32(progress_bar_xpos + progress_bar_width + 10.0),
-                i32(ypos), i32(media_player_buttons_sprite_width), i32(media_player_buttons_sprite_height)
-            }
 
             loop_on_sprite_dst := sdl3.FRect{
                 progress_bar_xpos + progress_bar_width + 10.0,
                 ypos, media_player_buttons_sprite_width, media_player_buttons_sprite_height }
             loop_on_sprite_src := sprite_atlas_src_rect_clip(gmem.animated_sprite_atlas, i32(SpriteRow.loop_on), animated_sprites[.loop_on].curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height)
-            loop_on_sprite_src_i := sdl3.Rect{i32(loop_on_sprite_src.x), i32(loop_on_sprite_src.y), i32(loop_on_sprite_src.w), i32(loop_on_sprite_src.h)}
             sdl3.RenderTexture(gmem.sdl_renderer, gmem.animated_sprite_atlas, &loop_on_sprite_src, &loop_on_sprite_dst)
         } else {
             loop_off_sprite_dst := sdl3.FRect{
