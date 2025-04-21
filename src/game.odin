@@ -232,7 +232,6 @@ game_init :: proc () {
     font_init(&gmem.fonts[1], "assets/joystix monospace.otf")
     font_init(&gmem.fonts[2], "assets/VCR_OSD_MONO.ttf")
 
-    // default_audio_filename := "C:\\Users\\johnb\\Music\\Full Moon Full Life (FULL VERSION LYRICS) _ Persona 3 Reload.mp3"
     default_audio_filename := "ASSETS/unlimited.mp3"
     // Note(johnb): all filenames are allocated with default allocator and then intented to be deleted before replacing
     // The reason is that currently, only one filename is really active at a time
@@ -576,7 +575,7 @@ game_update :: proc () {
                     mem.copy(rawptr(gmem.sound_audio_filename), rawptr(filelist[0]), size_filename)
                 }
 
-                sdl3.ShowOpenFileDialog(file_dialogue_callback, nil, gmem.sdl_window, &file_filters[0], len(file_filters), "C:\\Users\\johnb", false)
+                sdl3.ShowOpenFileDialog(file_dialogue_callback, nil, gmem.sdl_window, &file_filters[0], len(file_filters), "C:\\Users\\", false)
             }
         }
         else if sdl_event.type == .KEY_UP {
