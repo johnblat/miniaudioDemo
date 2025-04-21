@@ -18,6 +18,11 @@ should_run := true
 Game_Memory :: struct {
     ma_engine: ma.engine,
     ma_sound :ma.sound,
+    ma_decoder: ma.decoder,
+    pcm_frames: [^]f32,
+    frames_to_read: u64,
+    waveform: [1024*4]f32,
+    samples_per_waveform_index: u64,
     sound_audio_filename: cstring,
     bpm: f32,
     fonts :[3]Font,
@@ -200,6 +205,8 @@ sprite_atlas_src_rect_clip :: proc (texture: ^sdl3.Texture, row, col: i32, frame
 
 */
 
+nb_pcm_frames: u64
+
 @(export)
 game_init :: proc () {
     gmem = new(Game_Memory)
@@ -255,6 +262,36 @@ game_init :: proc () {
 
     img.image_free(&img_bytes[0])
     sdl3.DestroySurface(surface)
+
+    { // initialize decoder
+        ma_decoder_config := ma.decoder_config_init(ma.format.f32, 0, 0)
+        result := ma.decoder_init_file(gmem.sound_audio_filename, &ma_decoder_config, &gmem.ma_decoder)
+        total_pcm_frames: u64
+        ma.decoder_get_length_in_pcm_frames(&gmem.ma_decoder, &total_pcm_frames)
+
+        sample_rate := gmem.ma_decoder.outputSampleRate
+        gmem.frames_to_read = u64(total_pcm_frames) // seconds
+        channels := gmem.ma_decoder.outputChannels
+
+        gmem.pcm_frames = make([^]f32, total_pcm_frames * u64(channels))
+
+
+        ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &nb_pcm_frames)
+
+        gmem.samples_per_waveform_index = (nb_pcm_frames*u64(channels) + len(gmem.waveform) - 1) / len(gmem.waveform)
+        for x in 0..<len(gmem.waveform) {
+            peak : f32 = 0.0
+            for i in 0..<gmem.samples_per_waveform_index {
+                idx := (x * int(gmem.samples_per_waveform_index) + int(i))
+                sample := math.abs(gmem.pcm_frames[idx])
+                if sample > peak {
+                    peak = sample
+                }
+            }
+            gmem.waveform[x] = peak
+        }
+
+    }
 }
 
 @(export)
@@ -393,6 +430,8 @@ render_sprite_clip_from_atlas :: proc (renderer: ^sdl3.Renderer, atlas: ^sdl3.Te
 
 @(export)
 game_update :: proc () {
+    update_time_start := sdl3.GetTicks()
+
     seconds_in_minute : f32 = 60.0
     quarter_note_duration := seconds_in_minute / gmem.bpm
 
@@ -709,6 +748,62 @@ game_update :: proc () {
             col = animated_sprites[.pause].curr_frame
         }
         render_sprite_clip_from_atlas(gmem.sdl_renderer, gmem.animated_sprite_atlas, row, col, media_player_buttons_sprite_width, media_player_buttons_sprite_height, dstx, ypos, scale_of_buttons )
+
+        ypos += media_player_buttons_sprite_height + 20.0
+    }
+
+    { // draw waveform
+
+        // current_pcm_frame_cursor :u64
+        // ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame_cursor)
+
+        // begin_read_pcm_frame := current_pcm_frame_cursor - u64(gmem.ma_decoder.outputSampleRate * 5) // 5 seconds
+        // begin_read_pcm_frame = max(begin_read_pcm_frame, 0)
+
+        // seek_time_start := sdl3.GetTicks()
+        // ma.decoder_seek_to_pcm_frame(&gmem.ma_decoder, begin_read_pcm_frame)
+        // seek_time_end := sdl3.GetTicks()
+        // seek_time := seek_time_end - seek_time_start
+        // render_text_tprintf(gmem.sdl_renderer,  f32(screen_width - 400), 16.0 * 2, 16.0, 255, 255, 255, 255, gmem.fonts[1], "wfm seek time: %d ms", seek_time)
+
+        // decode_time_start := sdl3.GetTicks()
+        // ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], gmem.frames_to_read, &nb_pcm_frames)
+        // decode_time_end := sdl3.GetTicks()
+        // decode_time := decode_time_end - decode_time_start
+        // render_text_tprintf(gmem.sdl_renderer,  f32(screen_width - 400), 16.0, 16.0, 255, 255, 255, 255, gmem.fonts[1], "wfm decode time: %d ms", decode_time)
+
+        // samples_pre_waveform_line := (nb_pcm_frames) / 800
+        // for x in 0..<800 {
+        //     peak : f32 = 0.0
+        //     for i in 0..<samples_pre_waveform_line {
+        //         idx := (x * int(samples_pre_waveform_line) + int(i)) * int(gmem.ma_decoder.outputChannels)
+        //         sample := math.abs(gmem.pcm_frames[idx])
+        //         if sample > peak {
+        //             peak = sample
+        //         }
+        //     }
+        //     waveform[x] = peak
+        // }
+
+        // 800 / 2 = 400
+        // there 800 waveform columns
+        waveform_padding : i32 = 100
+        waveform_width : i32 = screen_width - waveform_padding*2
+        sample_max_height : f32 = 100.0
+
+        current_pcm_frame: u64
+        ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
+        current_waveform_index := (current_pcm_frame) / (gmem.samples_per_waveform_index * 2)
+        end_waveform_range := current_waveform_index + u64(waveform_width)
+        end_waveform_range = min(len(gmem.waveform), end_waveform_range)
+
+        for sample, offset in gmem.waveform[current_waveform_index:end_waveform_range] {
+            xpos := f32(waveform_padding + i32(offset))
+            y1 := ypos + (sample_max_height / 2.0 - sample * (sample_max_height/2.0))
+            y2 := ypos + ( sample_max_height / 2.0 + sample * (sample_max_height/2.0))
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
+            sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, xpos, y2)
+        }
     }
 
     // just draw all the sprite for demo
@@ -717,6 +812,13 @@ game_update :: proc () {
     for animated_sprite, sprite_row in animated_sprites {
         x := 10.0 + (media_player_buttons_sprite_width*2.0) * f32(sprite_row)
         render_sprite_clip_from_atlas(gmem.sdl_renderer, gmem.animated_sprite_atlas, i32(sprite_row), animated_sprite.curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height, x, ypos, 2.0)
+    }
+
+    update_time_end := sdl3.GetTicks()
+
+    frame_time := update_time_end - update_time_start
+    {
+        render_text_tprintf(gmem.sdl_renderer, f32(screen_width - 400), 0, 16.0, 255, 255,255,255, gmem.fonts[1], "frame time: %d ms", frame_time)
     }
 
     sdl3.RenderPresent(gmem.sdl_renderer)
