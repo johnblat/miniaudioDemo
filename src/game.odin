@@ -161,6 +161,45 @@ sprite_atlas_src_rect_clip :: proc (texture: ^sdl3.Texture, row, col: i32, frame
     return src
 }
 
+/*
+    Notes for "Adding silence before the track, or starting some time in the track":
+
+    Might be useful for making sure a beat is aligned on the 0th second of the song.
+
+    Useful for the metronome, and current beat and measure displays
+
+    There is basic support for scheduling the starting and stopping of nodes. You can only schedule one
+    start and one stop at a time. This is mainly intended for putting nodes into a started or stopped
+    state in a frame-exact manner. Without this mechanism, starting and stopping of a node is limited
+    to the resolution of a call to `ma_node_graph_read_pcm_frames()` which would typically be in blocks
+    of several milliseconds. The following APIs can be used for scheduling node states:
+
+        ```c
+        ma_node_set_state_time()
+        ma_node_get_state_time()
+        ```
+
+    The time is absolute and must be based on the global clock. An example is below:
+
+        ```c
+        ma_node_set_state_time(&myNode, ma_node_state_started, sampleRate*1);   // Delay starting to 1 second.
+        ma_node_set_state_time(&myNode, ma_node_state_stopped, sampleRate*5);   // Delay stopping to 5 seconds.
+        ```
+
+    An example for changing the state using a relative time.
+
+        ```c
+        ma_node_set_state_time(&myNode, ma_node_state_started, sampleRate*1 + ma_node_graph_get_time(&myNodeGraph));
+        ma_node_set_state_time(&myNode, ma_node_state_stopped, sampleRate*5 + ma_node_graph_get_time(&myNodeGraph));
+        ```
+
+    Note that due to the nature of multi-threading the times may not be 100% exact. If this is an
+    issue, consider scheduling state changes from within a processing callback. An idea might be to
+    have some kind of passthrough trigger node that is used specifically for tracking time and handling
+    events.
+
+*/
+
 @(export)
 game_init :: proc () {
     gmem = new(Game_Memory)
@@ -344,31 +383,11 @@ ma_seek_quarter_notes :: proc (quarter_note_duration, nb_quarter_notes: f32) {
 }
 
 
-file_dialogue_callback :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: c.int) {
-    is_no_file_selected := filelist[0] == nil
-    if is_no_file_selected {
-        return
-    }
-    ma.sound_uninit(&gmem.ma_sound)
-    // Note(jblat): only one file will be in the list
-    result := ma.sound_init_from_file(&gmem.ma_engine, filelist[0], {.DECODE}, nil, nil, &gmem.ma_sound)
-    ma.sound_start(&gmem.ma_sound)
+render_sprite_clip_from_atlas :: proc (renderer: ^sdl3.Renderer, atlas: ^sdl3.Texture, row, col: i32, frame_width, frame_height, dstx, dsty, dst_scale: f32) {
+    dst := sdl3.FRect {dstx, dsty, frame_width * dst_scale, frame_height * dst_scale}
+    src := sprite_atlas_src_rect_clip(atlas, row, col, frame_width, frame_height)
+    sdl3.RenderTexture(renderer, atlas, &src, &dst)
 
-    // TODO(jblat): is this the best way to handle this type of error?
-    context = context
-    if result != .SUCCESS {
-        result_description := ma.result_description(result)
-        fmt.printfln("[miniaudio] sound failed to init from file: %s. result: %s", filelist[0], result_description)
-        str := "audio file failed to load. try another file."
-        delete(gmem.sound_audio_filename)
-        gmem.sound_audio_filename = strings.clone_to_cstring(str)
-        return
-    }
-    delete(gmem.sound_audio_filename)
-    size_filename := len(filelist[0])
-    cstr := make([]byte, size_filename + 1)
-    gmem.sound_audio_filename = cstring(&cstr[0])
-    mem.copy(rawptr(gmem.sound_audio_filename), rawptr(filelist[0]), size_filename)
 }
 
 
@@ -411,6 +430,28 @@ game_update :: proc () {
                 ma_seek_quarter_notes(quarter_note_duration, -4.0)
             }
 
+            is_volume_up_button_pressed := sdl_event.key.scancode == .UP
+            if is_volume_up_button_pressed {
+                curr_volume := ma.engine_get_volume(&gmem.ma_engine)
+                new_volume := curr_volume + 0.1
+                new_volume = min(1.0, new_volume)
+                result := ma.engine_set_volume(&gmem.ma_engine, new_volume)
+                if result != .SUCCESS {
+                    fmt.printfln("[miniaudio] volume did not get set correctly: %v", result)
+                }
+            }
+
+            is_volume_down_button_presesd := sdl_event.key.scancode == .DOWN
+            if is_volume_down_button_presesd {
+                curr_volume := ma.engine_get_volume(&gmem.ma_engine)
+                new_volume := curr_volume - 0.1
+                result := ma.engine_set_volume(&gmem.ma_engine, new_volume)
+                if result != .SUCCESS {
+                    fmt.printfln("[miniaudio] volume did not get set correctly: %v", result)
+                }
+            }
+
+
             is_loop_toggle_button_pressed := sdl_event.key.scancode == .L
             if is_loop_toggle_button_pressed {
                 is_looping := ma.sound_is_looping(&gmem.ma_sound)
@@ -420,11 +461,44 @@ game_update :: proc () {
             is_open_file_dialogue_button_pressed := sdl_event.key.scancode == .F
             if is_open_file_dialogue_button_pressed {
                 file_filters := [?]sdl3.DialogFileFilter{
+                    {name = "Supported Audio Files", pattern = "mp3;wav;flac"},
                     {name = "MP3 File",  pattern = "mp3"},
                     {name = "WAV File",  pattern = "wav"},
                     {name = "FLAC File", pattern = "flac"},
                 }
-                sdl3.ShowOpenFileDialog(file_dialogue_callback, nil, gmem.sdl_window, nil, 0, "C:\\Users\\johnb", false)
+
+                file_dialogue_callback :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: c.int) {
+                    is_no_file_selected := filelist[0] == nil
+                    if is_no_file_selected {
+                        return
+                    }
+                    is_looping := ma.sound_is_looping(&gmem.ma_sound)
+                    ma.sound_uninit(&gmem.ma_sound)
+                    // Note(jblat): only one file will be in the list
+                    result := ma.sound_init_from_file(&gmem.ma_engine, filelist[0], {.DECODE}, nil, nil, &gmem.ma_sound)
+                    ma.sound_start(&gmem.ma_sound)
+                    ma.sound_set_looping(&gmem.ma_sound, is_looping)
+
+                    // Note(johnb): I think this is just needed because its a "c" proc and i'm calling odin functions that allocate memory
+                    context = context
+
+                    // TODO(jblat): is this the best way to handle this type of error?
+                    if result != .SUCCESS {
+                        result_description := ma.result_description(result)
+                        fmt.printfln("[miniaudio] sound failed to init from file: %s. result: %s", filelist[0], result_description)
+                        str := "audio file failed to load. try another file."
+                        delete(gmem.sound_audio_filename)
+                        gmem.sound_audio_filename = strings.clone_to_cstring(str)
+                        return
+                    }
+                    delete(gmem.sound_audio_filename)
+                    size_filename := len(filelist[0])
+                    cstr := make([]byte, size_filename + 1)
+                    gmem.sound_audio_filename = cstring(&cstr[0])
+                    mem.copy(rawptr(gmem.sound_audio_filename), rawptr(filelist[0]), size_filename)
+                }
+
+                sdl3.ShowOpenFileDialog(file_dialogue_callback, nil, gmem.sdl_window, &file_filters[0], len(file_filters), "C:\\Users\\johnb", false)
             }
         }
         else if sdl_event.type == .KEY_UP {
@@ -450,6 +524,28 @@ game_update :: proc () {
             ma.sound_stop(&gmem.ma_sound)
         } else {
             ma.sound_start(&gmem.ma_sound)
+        }
+    }
+
+    { // animated sprites update
+        for &animated_sprite in animated_sprites {
+            animated_sprite.timer += f32(1.0/60.0)
+            frame_duration_seconds : f32 = 1.0 / animated_sprite.frame_rate
+            total_duration_seconds := frame_duration_seconds * f32(animated_sprite.nb_frames)
+            nb_frames := animated_sprite.nb_frames
+            if animated_sprite.ping_pong {
+                total_duration_seconds *= 2
+                nb_frames *= 2
+            }
+            if animated_sprite.timer >= total_duration_seconds {
+                animated_sprite.timer = 0.0
+            }
+            curr_frame := i32(math.floor(animated_sprite.timer / frame_duration_seconds)) %% (nb_frames)
+            if curr_frame >= animated_sprite.nb_frames {
+                animated_sprite.curr_frame = (animated_sprite.nb_frames-1) - (curr_frame - animated_sprite.nb_frames)
+            } else {
+                animated_sprite.curr_frame = curr_frame
+            }
         }
     }
 
@@ -502,10 +598,38 @@ game_update :: proc () {
         sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,0,0,255)
         sdl3.RenderFillRect(gmem.sdl_renderer, &r)
     }
-    top_padding_for_progress_bar : f32 = 10.0
-    ypos += font_size * line_spacing_scale + top_padding_for_progress_bar
+    ypos += font_size * line_spacing_scale
+
+    { // volume
+        volume := ma.engine_get_volume(&gmem.ma_engine)
+        volume_0_to_10 := i32(math.round(volume * 10))
+        render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 0,0,0,255, gmem.fonts[1], "volume: %f", volume)
+        for i in 0..<volume_0_to_10 {
+            spacing : f32 = 10
+            size := font_size
+            volume_x := xpos + 250 + f32(i)*(size + spacing)
+            r := sdl3.FRect{volume_x, ypos, size, size}
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
+            sdl3.RenderFillRect(gmem.sdl_renderer, &r)
+        }
+        for i in volume_0_to_10..<10 {
+            spacing : f32 = 10
+            size := font_size
+            volume_x := xpos + 250 + f32(i)*(size + spacing)
+            r := sdl3.FRect{volume_x, ypos, size, size}
+            sdl3.SetRenderDrawBlendMode(gmem.sdl_renderer, {.BLEND})
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,100)
+            sdl3.RenderFillRect(gmem.sdl_renderer, &r)
+        }
+
+        ypos += font_size * line_spacing_scale
+    }
+
 
     { // progress bar
+        top_padding_for_progress_bar : f32 = 10.0
+        ypos += top_padding_for_progress_bar
+
         padding_for_progress_bar : f32 = 100.0
 
         progress_bar_width := f32(screen_width) - (padding_for_progress_bar * 2.0)
@@ -532,7 +656,6 @@ game_update :: proc () {
         sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
         sdl3.RenderFillRect(gmem.sdl_renderer, &future_progress_bar_rectangle)
 
-        // playhead_sprite := animated_sprites[.playhead]
         playhead_sprite_dst := sdl3.FRect{
             future_progress_xpos - (media_player_buttons_sprite_width/2.0),
             ypos - 3,
@@ -553,50 +676,47 @@ game_update :: proc () {
         }
 
         if ma.sound_is_looping(&gmem.ma_sound) {
-
             loop_on_sprite_dst := sdl3.FRect{
                 progress_bar_xpos + progress_bar_width + 10.0,
-                ypos, media_player_buttons_sprite_width, media_player_buttons_sprite_height }
+                ypos,
+                media_player_buttons_sprite_width,
+                media_player_buttons_sprite_height
+            }
             loop_on_sprite_src := sprite_atlas_src_rect_clip(gmem.animated_sprite_atlas, i32(SpriteRow.loop_on), animated_sprites[.loop_on].curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height)
             sdl3.RenderTexture(gmem.sdl_renderer, gmem.animated_sprite_atlas, &loop_on_sprite_src, &loop_on_sprite_dst)
         } else {
             loop_off_sprite_dst := sdl3.FRect{
                 progress_bar_xpos + progress_bar_width + 10.0,
-                ypos, media_player_buttons_sprite_width, media_player_buttons_sprite_height }
+                ypos,
+                media_player_buttons_sprite_width,
+                media_player_buttons_sprite_height
+            }
             loop_off_sprite_src := sprite_atlas_src_rect_clip(gmem.animated_sprite_atlas, i32(SpriteRow.loop_off), animated_sprites[.loop_off].curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height)
             sdl3.RenderTexture(gmem.sdl_renderer, gmem.animated_sprite_atlas, &loop_off_sprite_src, &loop_off_sprite_dst)
         }
-        ypos += progress_bar_height + padding_for_progress_bar
+        ypos += progress_bar_height + top_padding_for_progress_bar
     }
 
-    { // animated sprites
-        for &animated_sprite in animated_sprites {
-            animated_sprite.timer += f32(1.0/60.0)
-            frame_duration_seconds : f32 = 1.0 / animated_sprite.frame_rate
-            total_duration_seconds := frame_duration_seconds * f32(animated_sprite.nb_frames)
-            nb_frames := animated_sprite.nb_frames
-            if animated_sprite.ping_pong {
-                total_duration_seconds *= 2
-                nb_frames *= 2
-            }
-            if animated_sprite.timer >= total_duration_seconds {
-                animated_sprite.timer = 0.0
-            }
-            curr_frame := i32(math.floor(animated_sprite.timer / frame_duration_seconds)) %% (nb_frames)
-            if curr_frame >= animated_sprite.nb_frames {
-                animated_sprite.curr_frame = (animated_sprite.nb_frames-1) - (curr_frame - animated_sprite.nb_frames)
-            } else {
-                animated_sprite.curr_frame = curr_frame
-            }
+    { // draw actual media player sprites under progress bar
+        scale_of_buttons : f32 = 2.0
+        dstx : f32 = (f32(screen_width)/2.0) - (media_player_buttons_sprite_width*scale_of_buttons)/2.0
+
+        is_sound_playing := ma.sound_is_playing(&gmem.ma_sound)
+        row := i32(SpriteRow.play)
+        col := animated_sprites[.play].curr_frame
+        if !is_sound_playing {
+            row = i32(SpriteRow.pause)
+            col = animated_sprites[.pause].curr_frame
         }
-        width, height: f32
-        sdl3.GetTextureSize(gmem.animated_sprite_atlas, &width, &height)
-        for animated_sprite, sprite_row in animated_sprites {
-            src := sprite_atlas_src_rect_clip(gmem.animated_sprite_atlas, i32(sprite_row), animated_sprite.curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height)
-            dst := sdl3.FRect{xpos + (50.0*f32(sprite_row)), ypos, media_player_buttons_sprite_width * 2.0, media_player_buttons_sprite_height * 2.0}
-            ypos += media_player_buttons_sprite_height + 10.0
-            sdl3.RenderTexture(gmem.sdl_renderer, gmem.animated_sprite_atlas, &src, &dst)
-        }
+        render_sprite_clip_from_atlas(gmem.sdl_renderer, gmem.animated_sprite_atlas, row, col, media_player_buttons_sprite_width, media_player_buttons_sprite_height, dstx, ypos, scale_of_buttons )
+    }
+
+    // just draw all the sprite for demo
+    ypos = f32(screen_height) - (media_player_buttons_sprite_height*2.0) - 10.0
+
+    for animated_sprite, sprite_row in animated_sprites {
+        x := 10.0 + (media_player_buttons_sprite_width*2.0) * f32(sprite_row)
+        render_sprite_clip_from_atlas(gmem.sdl_renderer, gmem.animated_sprite_atlas, i32(sprite_row), animated_sprite.curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height, x, ypos, 2.0)
     }
 
     sdl3.RenderPresent(gmem.sdl_renderer)
