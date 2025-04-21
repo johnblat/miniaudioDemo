@@ -257,7 +257,7 @@ game_init :: proc () {
     img_bytes := img.load("assets/MediaPlayerButtons.png", &x, &y, &channels_in_file, 4)
     surface := sdl3.CreateSurfaceFrom(x, y, .RGBA32, &img_bytes[0], x*channels_in_file)
     gmem.animated_sprite_atlas = sdl3.CreateTextureFromSurface(gmem.sdl_renderer, surface)
-    // Note(jb1t): Do .NEAREST this so that:
+    // Note(johnb): Do .NEAREST this so that:
     // 1. The sprites aren't blurry when scaled
     // 2. The sprite source clip doesn't bleed any pixels to a neighboring sprite. This happens if sprite clips are butted up to each other in the atlas.
     sdl3.SetTextureScaleMode(gmem.animated_sprite_atlas, .NEAREST)
