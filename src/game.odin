@@ -293,42 +293,6 @@ game_init :: proc () {
             }
             gmem.waveform_samples[peak_index] = peak
         }
-
-        // for sample_index in 0..<total_samples{
-        //     sample := gmem.pcm_frames
-
-        // }
-
-        // for peak_idx in 0..<len(gmem.waveform_samples) {
-        //     peak : f32 = 0.0
-
-        // }
-
-        // for peak_idx in 0..<len(gmem.waveform_left) {
-        //     peak_left : f32 = 0.0
-        //     peak_right : f32 = 0.0
-        //     samples_per_peak := gmem.frames_per_waveform_peak * u64(channels)
-        //     for i in 0..<samples_per_peak {
-        //         idx := (peak_idx * int(samples_per_peak) + int(i))
-        //         if u64(idx) >= nb_pcm_frames*u64(channels) {
-        //             break
-        //         }
-        //         sample := math.abs(gmem.pcm_frames[idx])
-        //         sample_idx_is_left_channel := idx % 2 == 0
-        //         if sample_idx_is_left_channel {
-        //             if sample > peak_left {
-        //                 peak_left = sample
-        //             }
-        //         } else {
-        //             if sample > peak_right {
-        //                 peak_right = sample
-        //             }
-        //         }
-        //     }
-        //     gmem.waveform_left[peak_idx] = peak_left
-        //     gmem.waveform_right[peak_idx] = peak_right
-        // }
-
     }
 }
 
