@@ -7,6 +7,10 @@ import "core:math"
 import "core:mem"
 import "core:os/os2"
 import "core:strings"
+import "core:path/filepath"
+import "core:slice"
+import vmem "core:mem/virtual"
+import sa "core:container/small_array"
 import sdl3 "vendor:sdl3"
 import ma "vendor:miniaudio"
 import ttf "vendor:stb/truetype"
@@ -27,6 +31,8 @@ Game_Memory :: struct {
     samples_per_waveform_index: u64,
     frames_per_waveform_peak: u64,
     sound_audio_filename: cstring,
+    current_directory_audio_filenames_arena: vmem.Arena,
+    current_directory_audio_filenames: sa.Small_Array(64, cstring),
     bpm: f32,
     fonts :[3]Font,
     sdl_renderer: ^sdl3.Renderer,
@@ -221,7 +227,6 @@ game_init :: proc () {
         os2.exit(1)
     }
 
-    
     ma_init_result := ma.engine_init(nil, &gmem.ma_engine)
     if ma_init_result != .SUCCESS {
         fmt.printfln("[miniaudio] ma engine init failure")
@@ -231,6 +236,12 @@ game_init :: proc () {
     font_init(&gmem.fonts[0], "assets/CHECKBK0.TTF")
     font_init(&gmem.fonts[1], "assets/joystix monospace.otf")
     font_init(&gmem.fonts[2], "assets/VCR_OSD_MONO.ttf")
+
+    arena_alloc_error := vmem.arena_init_growing(&gmem.current_directory_audio_filenames_arena)
+    if arena_alloc_error != nil {
+        fmt.printfln("[core:mem/virtual] arena alloc error: %v", arena_alloc_error)
+        os2.exit(1)
+    }
 
     default_audio_filename := "ASSETS/unlimited.mp3"
     // Note(johnb): all filenames are allocated with default allocator and then intented to be deleted before replacing
@@ -429,7 +440,56 @@ render_sprite_clip_from_atlas :: proc (renderer: ^sdl3.Renderer, atlas: ^sdl3.Te
 
 }
 
+reinit_sound_decoder_and_waveform_from_file :: proc(filename: cstring ) -> ma.result {
+    is_looping := ma.sound_is_looping(&gmem.ma_sound)
+    ma.sound_uninit(&gmem.ma_sound)
+    // Note(jblat): only one file will be in the list
+    result := ma.sound_init_from_file(&gmem.ma_engine, filename, {.DECODE}, nil, nil, &gmem.ma_sound)
+    ma.sound_start(&gmem.ma_sound)
+    ma.sound_set_looping(&gmem.ma_sound, is_looping)
 
+    delete(gmem.sound_audio_filename)
+    size_filename := len(filename)
+    cstr := make([]byte, size_filename + 1)
+    cstr[len(cstr)-1] = 0
+    gmem.sound_audio_filename = cstring(&cstr[0])
+    mem.copy(rawptr(gmem.sound_audio_filename), rawptr(filename), size_filename)
+
+    { // replace the decoder and generate waveform visualization
+        ma.decoder_uninit(&gmem.ma_decoder)
+        free(gmem.pcm_frames)
+
+        ma_decoder_config := ma.decoder_config_init(ma.format.f32, 2,  gmem.ma_engine.sampleRate)
+        result := ma.decoder_init_file(gmem.sound_audio_filename, &ma_decoder_config, &gmem.ma_decoder)
+        total_pcm_frames: u64
+        ma.decoder_get_length_in_pcm_frames(&gmem.ma_decoder, &total_pcm_frames)
+
+        sample_rate := gmem.ma_decoder.outputSampleRate
+        gmem.frames_to_read = u64(total_pcm_frames) // seconds
+        channels := gmem.ma_decoder.outputChannels
+
+        gmem.pcm_frames = make([^]f32, total_pcm_frames * u64(channels))
+        total_samples := total_pcm_frames * u64(channels)
+
+        ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &nb_pcm_frames)
+        gmem.frames_per_waveform_peak = nb_pcm_frames / len(gmem.waveform_samples)
+        samples_per_peak := gmem.frames_per_waveform_peak * u64(channels)
+
+        for peak, peak_index in gmem.waveform_samples {
+            peak : f32 = 0.0
+            for i in 0..<samples_per_peak {
+                sample_index := peak_index * int(samples_per_peak) + int(i)
+                sample := math.abs(gmem.pcm_frames[sample_index])
+                if sample > peak {
+                    peak = sample
+                }
+            }
+            gmem.waveform_samples[peak_index] = peak
+        }
+    }
+
+    return ma.result.SUCCESS
+}
 @(export)
 game_update :: proc () {
     update_time_start := sdl3.GetTicks()
@@ -540,8 +600,35 @@ game_update :: proc () {
                     delete(gmem.sound_audio_filename)
                     size_filename := len(filelist[0])
                     cstr := make([]byte, size_filename + 1)
+                    cstr[len(cstr)-1] = 0
                     gmem.sound_audio_filename = cstring(&cstr[0])
                     mem.copy(rawptr(gmem.sound_audio_filename), rawptr(filelist[0]), size_filename)
+
+                    populate_directory_array: { // populate the direcotry array
+                        current_filepath_str := strings.clone_from_cstring(gmem.sound_audio_filename, context.temp_allocator) // C:\Users\johnb\Music\Japanese Breakfast - Jubilee\Japanese Breakfast - Jubilee - 02 Be Sweet.flac -> C:\Users\johnb\Music\Japanese Breakfast - Jubilee\Japanese Breakfast - Jubilee - 02 Be Sweet.flac\Users\johnb\Music\Japanese Breakfast - JubileeC:\Users\johnb\Music\Japanese Breakfast - Jubilee
+                        directory_of_selected_song := filepath.dir(current_filepath_str, context.temp_allocator) //C:\Users\johnb\Music\Japanese Breakfast - Jubilee
+                        files_in_dir, err := os2.read_directory_by_path(directory_of_selected_song, sa.cap(gmem.current_directory_audio_filenames), context.temp_allocator) // {data=0x000001298106c141 "C:\\Users\\johnb\\Music\\Japanese Breakfast - Jubilee\\AlbumArtSmall.jpgC:\\Users\\johnb\\Music\\Japanese Breakfast - Jubilee\\AlbumArt_{B5020207-474E-4720-B009-3B6D3E62C700}_Large.jpgC:\\Users\\johnb\\Music\\Japan... ...}
+                        if err != nil {
+                            fmt.printfln("[os/os2]: Error generating directory list: %v", err)
+                        }
+                        vmem.arena_free_all(&gmem.current_directory_audio_filenames_arena)
+                        x: for path_info in files_in_dir {
+                            path := path_info.fullpath
+                            fmt.printfln("path: %v", path)
+                            if os2.is_dir(path) {
+                                continue x
+                            }
+                            ext := filepath.ext(path)
+                            supported_audio_extensions := [?]string{".mp3", ".wav", ".flac"}
+                            _, is_supported_audio_extension := slice.linear_search(supported_audio_extensions[:], ext)
+                            if !is_supported_audio_extension {
+                                continue x
+                            }
+                            arena_allocator := vmem.arena_allocator(&gmem.current_directory_audio_filenames_arena)
+                            path_cstring := strings.clone_to_cstring(path, arena_allocator)
+                            sa.append_elem(&gmem.current_directory_audio_filenames, path_cstring)
+                        }
+                    }
 
                     { // replace the decoder and generate waveform visualization
                         ma.decoder_uninit(&gmem.ma_decoder)
@@ -603,6 +690,30 @@ game_update :: proc () {
             ma.sound_stop(&gmem.ma_sound)
         } else {
             ma.sound_start(&gmem.ma_sound)
+        }
+    }
+
+    { // handle going to next song
+        current_pcm_frame, total_pcm_frames : u64
+        ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
+        ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
+        is_sound_finished := current_pcm_frame == total_pcm_frames
+        if is_sound_finished {
+            for idx in 1..< sa.len(gmem.current_directory_audio_filenames) {
+                prev_idx := idx - 1
+                prev_filename := sa.get(gmem.current_directory_audio_filenames, prev_idx)
+                curr_filename := sa.get(gmem.current_directory_audio_filenames, idx)
+                if prev_filename == gmem.sound_audio_filename {
+                    gmem.sound_audio_filename = curr_filename
+                    ma.sound_uninit(&gmem.ma_sound)
+                    result := ma.sound_init_from_file(&gmem.ma_engine, gmem.sound_audio_filename, {.DECODE}, nil, nil, &gmem.ma_sound)
+                    if result != .SUCCESS {
+                        fmt.printfln("[miniaudio] error init from file: %v", result)
+                    }
+                    ma.sound_start(&gmem.ma_sound)
+                    break
+                }
+            }
         }
     }
 
@@ -789,7 +900,7 @@ game_update :: proc () {
         }
         render_sprite_clip_from_atlas(gmem.sdl_renderer, gmem.animated_sprite_atlas, row, col, media_player_buttons_sprite_width, media_player_buttons_sprite_height, dstx, ypos, scale_of_buttons )
 
-        ypos += media_player_buttons_sprite_height + 20.0
+        ypos += media_player_buttons_sprite_height + 5
     }
 
     { // draw waveform region
@@ -814,7 +925,7 @@ game_update :: proc () {
             sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, xpos, y2)
         }
 
-        ypos += wave_max_height + 20.0
+        ypos += wave_max_height + 50.0
     }
 
     { // try to draw osciliscopy waveform
