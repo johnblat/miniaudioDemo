@@ -215,13 +215,13 @@ game_init :: proc () {
     gmem = new(Game_Memory)
 
 
-    sdl_init_ok := sdl3.CreateWindowAndRenderer("MiniAudio Demo", screen_width, screen_height, {}, &gmem.sdl_window, &gmem.sdl_renderer)
+    sdl_init_ok := sdl3.CreateWindowAndRenderer("MiniAudio Demo", screen_width, screen_height,{.RESIZABLE}, &gmem.sdl_window, &gmem.sdl_renderer)
     if !sdl_init_ok {
         fmt.printfln("[SDL3] Window and renderer failed to init")
         os2.exit(1)
     }
 
-
+    
     ma_init_result := ma.engine_init(nil, &gmem.ma_engine)
     if ma_init_result != .SUCCESS {
         fmt.printfln("[miniaudio] ma engine init failure")
@@ -433,7 +433,12 @@ render_sprite_clip_from_atlas :: proc (renderer: ^sdl3.Renderer, atlas: ^sdl3.Te
 @(export)
 game_update :: proc () {
     update_time_start := sdl3.GetTicks()
+    actual_screen_width, actual_screen_height: i32
+    sdl3.GetWindowSize(gmem.sdl_window, &actual_screen_width, &actual_screen_height)
+    scale_width := f32(actual_screen_width) / f32(screen_width)
+    scale_height := f32(actual_screen_height) / f32(screen_height)
 
+    sdl3.SetRenderScale(gmem.sdl_renderer, scale_width, scale_height)
     seconds_in_minute : f32 = 60.0
     quarter_note_duration := seconds_in_minute / gmem.bpm
 
@@ -627,7 +632,7 @@ game_update :: proc () {
     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 120, 100, 0, 255)
     sdl3.RenderClear(gmem.sdl_renderer)
 
-    font_size : f32 = 22
+    font_size : f32 = 12
     line_spacing_scale : f32 = 1.1
     xpos : f32 = 1
     ypos : f32 = 1
@@ -787,41 +792,7 @@ game_update :: proc () {
         ypos += media_player_buttons_sprite_height + 20.0
     }
 
-    { // draw waveform
-
-        // current_pcm_frame_cursor :u64
-        // ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame_cursor)
-
-        // begin_read_pcm_frame := current_pcm_frame_cursor - u64(gmem.ma_decoder.outputSampleRate * 5) // 5 seconds
-        // begin_read_pcm_frame = max(begin_read_pcm_frame, 0)
-
-        // seek_time_start := sdl3.GetTicks()
-        // ma.decoder_seek_to_pcm_frame(&gmem.ma_decoder, begin_read_pcm_frame)
-        // seek_time_end := sdl3.GetTicks()
-        // seek_time := seek_time_end - seek_time_start
-        // render_text_tprintf(gmem.sdl_renderer,  f32(screen_width - 400), 16.0 * 2, 16.0, 255, 255, 255, 255, gmem.fonts[1], "wfm seek time: %d ms", seek_time)
-
-        // decode_time_start := sdl3.GetTicks()
-        // ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], gmem.frames_to_read, &nb_pcm_frames)
-        // decode_time_end := sdl3.GetTicks()
-        // decode_time := decode_time_end - decode_time_start
-        // render_text_tprintf(gmem.sdl_renderer,  f32(screen_width - 400), 16.0, 16.0, 255, 255, 255, 255, gmem.fonts[1], "wfm decode time: %d ms", decode_time)
-
-        // samples_pre_waveform_line := (nb_pcm_frames) / 800
-        // for x in 0..<800 {
-        //     peak : f32 = 0.0
-        //     for i in 0..<samples_pre_waveform_line {
-        //         idx := (x * int(samples_pre_waveform_line) + int(i)) * int(gmem.ma_decoder.outputChannels)
-        //         sample := math.abs(gmem.pcm_frames[idx])
-        //         if sample > peak {
-        //             peak = sample
-        //         }
-        //     }
-        //     waveform[x] = peak
-        // }
-
-        // 800 / 2 = 400
-        // there 800 waveform columns
+    { // draw waveform region
         waveform_padding : i32 = 100
         waveform_width : i32 = screen_width - waveform_padding*2
         wave_max_height : f32 = 100.0
@@ -835,34 +806,48 @@ game_update :: proc () {
         end_waveform_range := current_waveform_index + u64(waveform_width)
         end_waveform_range = min(len(gmem.waveform_left), end_waveform_range)
 
-        // for peak_index, offset in current_waveform_index..<end_waveform_range {
-        //     peak := gmem.waveform_left[peak_index]
-        //     xpos := f32(waveform_padding + i32(offset))
-        //     y1 := ypos + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
-        //     y2 := ypos + ( wave_max_height / 2.0 + peak * (wave_max_height/2.0))
-        //     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
-        //     sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, xpos, y2)
-        // }
-
-
-        // ypos += wave_max_height + 20.0
-
-        // for peak_index, offset in current_waveform_index..<end_waveform_range {
-        //     peak := gmem.waveform_right[peak_index]
-        //     xpos := f32(waveform_padding + i32(offset))
-        //     y1 := ypos + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
-        //     y2 := ypos + ( wave_max_height / 2.0 + peak * (wave_max_height/2.0))
-        //     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
-        //     sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, xpos, y2)
-        // }
-
-
         for peak, offset in gmem.waveform_samples[current_waveform_index:end_waveform_range] {
             xpos := f32(waveform_padding + i32(offset))
             y1 := ypos + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
             y2 := ypos + ( wave_max_height / 2.0 + peak * (wave_max_height/2.0))
             sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,255,255,255)
             sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, xpos, y2)
+        }
+
+        ypos += wave_max_height + 20.0
+    }
+
+    { // try to draw osciliscopy waveform
+        waveform_padding : i32 = 600
+        waveform_width : i32 = screen_width - waveform_padding*2
+        wave_max_height : f32 = 500.0
+
+        nb_waveform_indices_in_visualization := 20
+        current_pcm_frame: u64
+        ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
+        total_pcm_frames: u64
+        ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
+        current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
+        current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
+        begin_waveform_index := current_waveform_index - u64(nb_waveform_indices_in_visualization/2)
+        begin_waveform_index = clamp(begin_waveform_index, 0, len(gmem.waveform_samples))
+        end_waveform_index := current_waveform_index + u64(nb_waveform_indices_in_visualization/2)
+        end_waveform_index = clamp(end_waveform_index, 0, len(gmem.waveform_samples))
+
+        index_x_spacing :=  waveform_width /  i32(nb_waveform_indices_in_visualization) // lol i have no idea
+        for i, offset in begin_waveform_index..<end_waveform_index {
+            xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset))
+            next_xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset+1))
+            peak := gmem.waveform_samples[i]
+            if i + 1 >= len(gmem.waveform_samples) {
+                break // gtfo
+            }
+            next_peak := gmem.waveform_samples[i+1]
+            y1 := ypos + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
+            next_y2 := ypos + (wave_max_height / 2.0 - next_peak * (wave_max_height/2.0))
+
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,0,255,255)
+            sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
         }
     }
 
