@@ -537,6 +537,39 @@ game_update :: proc () {
                     cstr := make([]byte, size_filename + 1)
                     gmem.sound_audio_filename = cstring(&cstr[0])
                     mem.copy(rawptr(gmem.sound_audio_filename), rawptr(filelist[0]), size_filename)
+
+                    { // replace the decoder and generate waveform visualization
+                        ma.decoder_uninit(&gmem.ma_decoder)
+                        free(gmem.pcm_frames)
+
+                        ma_decoder_config := ma.decoder_config_init(ma.format.f32, 2,  gmem.ma_engine.sampleRate)
+                        result := ma.decoder_init_file(gmem.sound_audio_filename, &ma_decoder_config, &gmem.ma_decoder)
+                        total_pcm_frames: u64
+                        ma.decoder_get_length_in_pcm_frames(&gmem.ma_decoder, &total_pcm_frames)
+
+                        sample_rate := gmem.ma_decoder.outputSampleRate
+                        gmem.frames_to_read = u64(total_pcm_frames) // seconds
+                        channels := gmem.ma_decoder.outputChannels
+
+                        gmem.pcm_frames = make([^]f32, total_pcm_frames * u64(channels))
+                        total_samples := total_pcm_frames * u64(channels)
+
+                        ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &nb_pcm_frames)
+                        gmem.frames_per_waveform_peak = nb_pcm_frames / len(gmem.waveform_samples)
+                        samples_per_peak := gmem.frames_per_waveform_peak * u64(channels)
+
+                        for peak, peak_index in gmem.waveform_samples {
+                            peak : f32 = 0.0
+                            for i in 0..<samples_per_peak {
+                                sample_index := peak_index * int(samples_per_peak) + int(i)
+                                sample := math.abs(gmem.pcm_frames[sample_index])
+                                if sample > peak {
+                                    peak = sample
+                                }
+                            }
+                            gmem.waveform_samples[peak_index] = peak
+                        }
+                    }
                 }
 
                 sdl3.ShowOpenFileDialog(file_dialogue_callback, nil, gmem.sdl_window, &file_filters[0], len(file_filters), "C:\\Users\\", false)
@@ -798,6 +831,7 @@ game_update :: proc () {
         total_pcm_frames: u64
         ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
         current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
+        current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
         end_waveform_range := current_waveform_index + u64(waveform_width)
         end_waveform_range = min(len(gmem.waveform_left), end_waveform_range)
 
@@ -827,7 +861,7 @@ game_update :: proc () {
             xpos := f32(waveform_padding + i32(offset))
             y1 := ypos + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
             y2 := ypos + ( wave_max_height / 2.0 + peak * (wave_max_height/2.0))
-            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,255,255,255)
             sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, xpos, y2)
         }
     }
