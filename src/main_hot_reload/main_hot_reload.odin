@@ -12,6 +12,8 @@ import "core:os"
 import "core:os/os2"
 import "core:log"
 import "core:mem"
+import "base:runtime"
+
 
 when ODIN_OS == .Windows {
 	DLL_EXT :: ".dll"
@@ -97,25 +99,30 @@ unload_game_api :: proc(api: ^Game_API) {
 	}
 }
 
+tracking_allocator: mem.Tracking_Allocator
+
 main :: proc() {
-	context.logger = log.create_console_logger()
-
+	// context.logger = log.create_console_logger()
 	default_allocator := context.allocator
-	tracking_allocator: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&tracking_allocator, default_allocator)
-	context.allocator = mem.tracking_allocator(&tracking_allocator)
 
-	reset_tracking_allocator :: proc(a: ^mem.Tracking_Allocator) -> bool {
-		err := false
+	
+	// mem.tracking_allocator_init(&tracking_allocator, default_allocator)
+	// // TODO(johnb): This will break what i was doing in the C proc
+	// // maybe thers a way to set the runtime default context to this
+	// context.allocator = mem.tracking_allocator(&tracking_allocator)
+	
 
-		for _, value in a.allocation_map {
-			fmt.printf("%v: Leaked %v bytes\n", value.location, value.size)
-			err = true
-		}
+	// reset_tracking_allocator :: proc(a: ^mem.Tracking_Allocator) -> bool {
+	// 	err := false
 
-		mem.tracking_allocator_clear(a)
-		return err
-	}
+	// 	for _, value in a.allocation_map {
+	// 		fmt.printf("%v: Leaked %v bytes\n", value.location, value.size)
+	// 		err = true
+	// 	}
+
+	// 	mem.tracking_allocator_clear(a)
+	// 	return err
+	// }
 
 	game_api_version := 0
 	game_api, game_api_ok := load_game_api(game_api_version)
@@ -185,7 +192,7 @@ main :: proc() {
 					// probably lead to a crash anyways.
 
 					game_api.shutdown()
-					reset_tracking_allocator(&tracking_allocator)
+					// reset_tracking_allocator(&tracking_allocator)
 
 					for &g in old_game_apis {
 						unload_game_api(&g)
@@ -221,15 +228,15 @@ main :: proc() {
 
 	free_all(context.temp_allocator)
 	game_api.shutdown()
-	if reset_tracking_allocator(&tracking_allocator) {
-		// Note from karl:
-        // This prevents the game from closing without you seeing the memory
-		// leaks. This is mostly needed because I use Sublime Text and my game's
-		// console isn't hooked up into Sublime's console properly.
-        //
-        // NOTE(johnb): uncomment if ur console isn't hooked up to the game properly
-		// libc.getchar()
-	}
+	// if reset_tracking_allocator(&tracking_allocator) {
+	// 	// Note from karl:
+    //     // This prevents the game from closing without you seeing the memory
+	// 	// leaks. This is mostly needed because I use Sublime Text and my game's
+	// 	// console isn't hooked up into Sublime's console properly.
+    //     //
+    //     // NOTE(johnb): uncomment if ur console isn't hooked up to the game properly
+	// 	// libc.getchar()
+	// }
 
 	for &g in old_game_apis {
 		// FIXME(johnb): This breaks when there are any old game apis

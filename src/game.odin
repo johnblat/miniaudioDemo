@@ -9,6 +9,7 @@ import "core:os/os2"
 import "core:strings"
 import "core:path/filepath"
 import "core:slice"
+import "base:runtime"
 import vmem "core:mem/virtual"
 import sa "core:container/small_array"
 import sdl3 "vendor:sdl3"
@@ -218,6 +219,9 @@ nb_pcm_frames: u64
 
 @(export)
 game_init :: proc () {
+    // TODO(johnb): Setup tracking allocator in here. Make it separate from the hot reload app. The reason is that hopefully we
+    // can allocate stuff with the tracking allocator in the C proc, as i currently think calling an allocating function directly
+    // from the C proc won't involve any re-organization of the logic if we want a tracking allcator
     gmem = new(Game_Memory)
 
 
@@ -574,35 +578,74 @@ game_update :: proc () {
                 }
 
                 file_dialogue_callback :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: c.int) {
+                    context = context
+                    // context.allocator = tracking_allocator
                     is_no_file_selected := filelist[0] == nil
                     if is_no_file_selected {
                         return
                     }
-                    is_looping := ma.sound_is_looping(&gmem.ma_sound)
-                    ma.sound_uninit(&gmem.ma_sound)
-                    // Note(jblat): only one file will be in the list
-                    result := ma.sound_init_from_file(&gmem.ma_engine, filelist[0], {.DECODE}, nil, nil, &gmem.ma_sound)
-                    ma.sound_start(&gmem.ma_sound)
-                    ma.sound_set_looping(&gmem.ma_sound, is_looping)
-
-                    // Note(johnb): I think this is just needed because its a "c" proc and i'm calling odin functions that allocate memory
-                    context = context
-
-                    // TODO(jblat): is this the best way to handle this type of error?
-                    if result != .SUCCESS {
-                        result_description := ma.result_description(result)
-                        fmt.printfln("[miniaudio] sound failed to init from file: %s. result: %s", filelist[0], result_description)
-                        str := "audio file failed to load. try another file."
+                    { // reinit stuff
+                        is_looping := ma.sound_is_looping(&gmem.ma_sound)
+                        ma.sound_uninit(&gmem.ma_sound)
+                        // Note(jblat): only one file will be in the list
+                        result := ma.sound_init_from_file(&gmem.ma_engine, filelist[0], {.DECODE}, nil, nil, &gmem.ma_sound)
+                        ma.sound_start(&gmem.ma_sound)
+                        ma.sound_set_looping(&gmem.ma_sound, is_looping)
+    
+                        // Note(johnb): I think this is just needed because its a "c" proc and i'm calling odin functions that allocate memory
+    
+                        // TODO(jblat): is this the best way to handle this type of error?
+                        if result != .SUCCESS {
+                            result_description := ma.result_description(result)
+                            fmt.printfln("[miniaudio] sound failed to init from file: %s. result: %s", filelist[0], result_description)
+                            str := "audio file failed to load: "
+                            strs := [?]string{str, string(gmem.sound_audio_filename)}
+                            final_str := strings.join(strs[:], "", context.temp_allocator)
+                            delete(gmem.sound_audio_filename)
+                            gmem.sound_audio_filename = strings.clone_to_cstring(final_str)
+                            return
+                        }
                         delete(gmem.sound_audio_filename)
-                        gmem.sound_audio_filename = strings.clone_to_cstring(str)
-                        return
+                        size_filename := len(filelist[0])
+                        cstr := make([]byte, size_filename + 1)
+                        cstr[len(cstr)-1] = 0
+                        gmem.sound_audio_filename = cstring(&cstr[0])
+                        mem.copy(rawptr(gmem.sound_audio_filename), rawptr(filelist[0]), size_filename)
+    
+                        { // replace the decoder and generate waveform visualization
+                            ma.decoder_uninit(&gmem.ma_decoder)
+                            free(gmem.pcm_frames)
+    
+                            ma_decoder_config := ma.decoder_config_init(ma.format.f32, 2,  gmem.ma_engine.sampleRate)
+                            result := ma.decoder_init_file(gmem.sound_audio_filename, &ma_decoder_config, &gmem.ma_decoder)
+                            total_pcm_frames: u64
+                            ma.decoder_get_length_in_pcm_frames(&gmem.ma_decoder, &total_pcm_frames)
+    
+                            sample_rate := gmem.ma_decoder.outputSampleRate
+                            gmem.frames_to_read = u64(total_pcm_frames) // seconds
+                            channels := gmem.ma_decoder.outputChannels
+    
+                            gmem.pcm_frames = make([^]f32, total_pcm_frames * u64(channels))
+                            total_samples := total_pcm_frames * u64(channels)
+    
+                            ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &nb_pcm_frames)
+                            gmem.frames_per_waveform_peak = nb_pcm_frames / len(gmem.waveform_samples)
+                            samples_per_peak := gmem.frames_per_waveform_peak * u64(channels)
+    
+                            for peak, peak_index in gmem.waveform_samples {
+                                peak : f32 = 0.0
+                                for i in 0..<samples_per_peak {
+                                    sample_index := peak_index * int(samples_per_peak) + int(i)
+                                    sample := math.abs(gmem.pcm_frames[sample_index])
+                                    if sample > peak {
+                                        peak = sample
+                                    }
+                                }
+                                gmem.waveform_samples[peak_index] = peak
+                            }
+                        }
                     }
-                    delete(gmem.sound_audio_filename)
-                    size_filename := len(filelist[0])
-                    cstr := make([]byte, size_filename + 1)
-                    cstr[len(cstr)-1] = 0
-                    gmem.sound_audio_filename = cstring(&cstr[0])
-                    mem.copy(rawptr(gmem.sound_audio_filename), rawptr(filelist[0]), size_filename)
+                    
 
                     populate_directory_array: { // populate the direcotry array
                         current_filepath_str := strings.clone_from_cstring(gmem.sound_audio_filename, context.temp_allocator) // C:\Users\johnb\Music\Japanese Breakfast - Jubilee\Japanese Breakfast - Jubilee - 02 Be Sweet.flac -> C:\Users\johnb\Music\Japanese Breakfast - Jubilee\Japanese Breakfast - Jubilee - 02 Be Sweet.flac\Users\johnb\Music\Japanese Breakfast - JubileeC:\Users\johnb\Music\Japanese Breakfast - Jubilee
@@ -630,38 +673,7 @@ game_update :: proc () {
                         }
                     }
 
-                    { // replace the decoder and generate waveform visualization
-                        ma.decoder_uninit(&gmem.ma_decoder)
-                        free(gmem.pcm_frames)
-
-                        ma_decoder_config := ma.decoder_config_init(ma.format.f32, 2,  gmem.ma_engine.sampleRate)
-                        result := ma.decoder_init_file(gmem.sound_audio_filename, &ma_decoder_config, &gmem.ma_decoder)
-                        total_pcm_frames: u64
-                        ma.decoder_get_length_in_pcm_frames(&gmem.ma_decoder, &total_pcm_frames)
-
-                        sample_rate := gmem.ma_decoder.outputSampleRate
-                        gmem.frames_to_read = u64(total_pcm_frames) // seconds
-                        channels := gmem.ma_decoder.outputChannels
-
-                        gmem.pcm_frames = make([^]f32, total_pcm_frames * u64(channels))
-                        total_samples := total_pcm_frames * u64(channels)
-
-                        ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &nb_pcm_frames)
-                        gmem.frames_per_waveform_peak = nb_pcm_frames / len(gmem.waveform_samples)
-                        samples_per_peak := gmem.frames_per_waveform_peak * u64(channels)
-
-                        for peak, peak_index in gmem.waveform_samples {
-                            peak : f32 = 0.0
-                            for i in 0..<samples_per_peak {
-                                sample_index := peak_index * int(samples_per_peak) + int(i)
-                                sample := math.abs(gmem.pcm_frames[sample_index])
-                                if sample > peak {
-                                    peak = sample
-                                }
-                            }
-                            gmem.waveform_samples[peak_index] = peak
-                        }
-                    }
+                   
                 }
 
                 sdl3.ShowOpenFileDialog(file_dialogue_callback, nil, gmem.sdl_window, &file_filters[0], len(file_filters), "C:\\Users\\", false)
@@ -694,23 +706,74 @@ game_update :: proc () {
     }
 
     { // handle going to next song
-        current_pcm_frame, total_pcm_frames : u64
-        ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
-        ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
-        is_sound_finished := current_pcm_frame == total_pcm_frames
+        is_sound_finished := gmem.ma_sound.atEnd
         if is_sound_finished {
             for idx in 1..< sa.len(gmem.current_directory_audio_filenames) {
                 prev_idx := idx - 1
                 prev_filename := sa.get(gmem.current_directory_audio_filenames, prev_idx)
                 curr_filename := sa.get(gmem.current_directory_audio_filenames, idx)
                 if prev_filename == gmem.sound_audio_filename {
-                    gmem.sound_audio_filename = curr_filename
-                    ma.sound_uninit(&gmem.ma_sound)
-                    result := ma.sound_init_from_file(&gmem.ma_engine, gmem.sound_audio_filename, {.DECODE}, nil, nil, &gmem.ma_sound)
-                    if result != .SUCCESS {
-                        fmt.printfln("[miniaudio] error init from file: %v", result)
+                    { // reinit stuff
+                        is_looping := ma.sound_is_looping(&gmem.ma_sound)
+                        ma.sound_uninit(&gmem.ma_sound)
+                        // Note(jblat): only one file will be in the list
+                        result := ma.sound_init_from_file(&gmem.ma_engine, curr_filename, {.DECODE}, nil, nil, &gmem.ma_sound)
+                        ma.sound_start(&gmem.ma_sound)
+                        ma.sound_set_looping(&gmem.ma_sound, is_looping)
+    
+                        // Note(johnb): I think this is just needed because its a "c" proc and i'm calling odin functions that allocate memory
+    
+                        // TODO(jblat): is this the best way to handle this type of error?
+                        if result != .SUCCESS {
+                            result_description := ma.result_description(result)
+                            fmt.printfln("[miniaudio] sound failed to init from file: %s. result: %s", curr_filename, result_description)
+                            str := "audio file failed to load: "
+                            strs := [?]string{str, string(gmem.sound_audio_filename)}
+                            final_str := strings.join(strs[:], "", context.temp_allocator)
+                            delete(gmem.sound_audio_filename)
+                            gmem.sound_audio_filename = strings.clone_to_cstring(final_str)
+                            break
+                        }
+                        delete(gmem.sound_audio_filename)
+                        size_filename := len(curr_filename)
+                        cstr := make([]byte, size_filename + 1)
+                        cstr[len(cstr)-1] = 0
+                        gmem.sound_audio_filename = cstring(&cstr[0])
+                        mem.copy(rawptr(gmem.sound_audio_filename), rawptr(curr_filename), size_filename)
+    
+                        { // replace the decoder and generate waveform visualization
+                            ma.decoder_uninit(&gmem.ma_decoder)
+                            free(gmem.pcm_frames)
+    
+                            ma_decoder_config := ma.decoder_config_init(ma.format.f32, 2,  gmem.ma_engine.sampleRate)
+                            result := ma.decoder_init_file(gmem.sound_audio_filename, &ma_decoder_config, &gmem.ma_decoder)
+                            total_pcm_frames: u64
+                            ma.decoder_get_length_in_pcm_frames(&gmem.ma_decoder, &total_pcm_frames)
+    
+                            sample_rate := gmem.ma_decoder.outputSampleRate
+                            gmem.frames_to_read = u64(total_pcm_frames) // seconds
+                            channels := gmem.ma_decoder.outputChannels
+    
+                            gmem.pcm_frames = make([^]f32, total_pcm_frames * u64(channels))
+                            total_samples := total_pcm_frames * u64(channels)
+    
+                            ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &nb_pcm_frames)
+                            gmem.frames_per_waveform_peak = nb_pcm_frames / len(gmem.waveform_samples)
+                            samples_per_peak := gmem.frames_per_waveform_peak * u64(channels)
+    
+                            for peak, peak_index in gmem.waveform_samples {
+                                peak : f32 = 0.0
+                                for i in 0..<samples_per_peak {
+                                    sample_index := peak_index * int(samples_per_peak) + int(i)
+                                    sample := math.abs(gmem.pcm_frames[sample_index])
+                                    if sample > peak {
+                                        peak = sample
+                                    }
+                                }
+                                gmem.waveform_samples[peak_index] = peak
+                            }
+                        }
                     }
-                    ma.sound_start(&gmem.ma_sound)
                     break
                 }
             }

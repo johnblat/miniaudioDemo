@@ -28,4 +28,4 @@ if not exist "SDL3.lib" (
 	)
 )
 
-odin build src/main_default -debug -out:%OUT_DIR%\%name%.exe -vet-unused -vet-unused-variables -vet-unused-imports -vet-shadowing
+odin build src/main_default -debug -out:%OUT_DIR%\%name%.exe
