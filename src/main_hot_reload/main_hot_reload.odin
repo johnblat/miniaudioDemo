@@ -167,6 +167,11 @@ main :: proc() {
 		if reload {
 			new_game_api, new_game_api_ok := load_game_api(game_api_version)
 
+			// FIXME(johnb): If the in-app file explorer opens up a directory that contains a build/*.dll path, then this
+			// hot reloader will try to reload that and crash
+			// not sure if its any dll, or one with this naming convention... which raw rhythm also has
+			// 1. Why does the current directory of the app change? Can or should this behavior be changed
+			// 2. Take a quick look to see if its a naiming convention thing or any .dll will crash this.
 			if new_game_api_ok {
 				force_restart = force_restart || game_api.memory_size() != new_game_api.memory_size()
 

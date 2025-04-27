@@ -24,12 +24,15 @@ Game_Memory :: struct {
     ma_engine: ma.engine,
     ma_sound :ma.sound,
     ma_decoder: ma.decoder,
-    pcm_frames: [^]f32,
-    frames_to_read: u64,
-    waveform_left: [1024*4]f32,
-    waveform_right: [1024*4]f32,
-    waveform_samples: [1024*4]f32,
-    samples_per_waveform_index: u64,
+    // Note(johb): Although this is called pcm_frames, this is a copy of a fully decoded
+    // audio stream, so really, each index is a sample. It's called that, cause its what miniaudio calls it.
+    // A call to ma.sound_get_cursor_in_pcm_frames will need to be scaled by number of channels
+    // to get index into this array
+    // TODO(johnb): Want to make this dynamic eventually. When we do that, will need to keep it either
+    // threadsafe, or ensure that it is only ever cleared in the main thread serially
+    pcm_frames: [57_600_000]f32, // 10 minutes worth of 2-channel audio at 48Khz/sec
+    nb_pcm_frames: u64,
+    waveform_samples: [1024*10]f32,
     frames_per_waveform_peak: u64,
     sound_audio_filename: cstring,
     current_directory_audio_filenames_arena: vmem.Arena,
@@ -62,16 +65,6 @@ game_memory_size :: proc() -> int {
 Input_State :: enum {up, pressed, down, released}
 Input_Command :: enum {play_toggle, force_hot_reload, force_build_and_hot_reload, force_restart, restart_sound}
 Input_App_Key :: enum {Enter, LeftShift, RightShift, F5, F6, F7}
-
-// INPUT_COMMAND_KEYMAP := [Input_App_Key] Input_Command {
-//     .Enter = .play_toggle,
-//     .RightShift = .restart_sound,
-//     .F5 = .force_build_and_hot_reload,
-//     .F6 = .force_hot_reload,
-//     .F7 = .force_restart,
-// }
-
-// input_command_state := [Input_Command]Input_State {}
 
 TTF_CHAR_AT_START : i32 :  32
 TTF_CHAR_AMOUNT : i32 : 95
@@ -127,8 +120,8 @@ font_init :: proc(font: ^Font, filename: string) {
     }
 }
 
-screen_width : i32 = 1280
-screen_height : i32 = 720
+screen_width : i32 = 1920
+screen_height : i32 = 1080
 
 media_player_buttons_sprite_width : f32 = 34
 media_player_buttons_sprite_height : f32 = 33
@@ -215,7 +208,6 @@ sprite_atlas_src_rect_clip :: proc (texture: ^sdl3.Texture, row, col: i32, frame
 
 */
 
-nb_pcm_frames: u64
 
 @(export)
 game_init :: proc () {
@@ -256,11 +248,17 @@ game_init :: proc () {
     // that is nice to display in a media player
     gmem.sound_audio_filename = strings.clone_to_cstring(default_audio_filename)
 
-    sound_init_result := ma.sound_init_from_file(&gmem.ma_engine, gmem.sound_audio_filename, {.DECODE}, nil, nil, &gmem.ma_sound)
-    if sound_init_result != .SUCCESS {
+    result := reinit_sound_decoder_and_waveform_from_file(gmem.sound_audio_filename)
+    if result != .SUCCESS {
         fmt.printfln("[miniaudio] sound initialization from file failed")
         os2.exit(1)
     }
+
+    // sound_init_result := ma.sound_init_from_file(&gmem.ma_engine, gmem.sound_audio_filename, {.DECODE}, nil, nil, &gmem.ma_sound)
+    // if sound_init_result != .SUCCESS {
+    //     fmt.printfln("[miniaudio] sound initialization from file failed")
+    //     os2.exit(1)
+    // }
 
     sound_start_result := ma.sound_start(&gmem.ma_sound)
     if sound_start_result != .SUCCESS {
@@ -280,35 +278,6 @@ game_init :: proc () {
     img.image_free(&img_bytes[0])
     sdl3.DestroySurface(surface)
 
-    { // initialize decoder
-        ma_decoder_config := ma.decoder_config_init(ma.format.f32, 2,  gmem.ma_engine.sampleRate)
-        result := ma.decoder_init_file(gmem.sound_audio_filename, &ma_decoder_config, &gmem.ma_decoder)
-        total_pcm_frames: u64
-        ma.decoder_get_length_in_pcm_frames(&gmem.ma_decoder, &total_pcm_frames)
-
-        sample_rate := gmem.ma_decoder.outputSampleRate
-        gmem.frames_to_read = u64(total_pcm_frames) // seconds
-        channels := gmem.ma_decoder.outputChannels
-
-        gmem.pcm_frames = make([^]f32, total_pcm_frames * u64(channels))
-        total_samples := total_pcm_frames * u64(channels)
-
-        ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &nb_pcm_frames)
-        gmem.frames_per_waveform_peak = nb_pcm_frames / len(gmem.waveform_samples)
-        samples_per_peak := gmem.frames_per_waveform_peak * u64(channels)
-
-        for peak, peak_index in gmem.waveform_samples {
-            peak : f32 = 0.0
-            for i in 0..<samples_per_peak {
-                sample_index := peak_index * int(samples_per_peak) + int(i)
-                sample := math.abs(gmem.pcm_frames[sample_index])
-                if sample > peak {
-                    peak = sample
-                }
-            }
-            gmem.waveform_samples[peak_index] = peak
-        }
-    }
 }
 
 @(export)
@@ -445,6 +414,10 @@ render_sprite_clip_from_atlas :: proc (renderer: ^sdl3.Renderer, atlas: ^sdl3.Te
 }
 
 reinit_sound_decoder_and_waveform_from_file :: proc(filename: cstring ) -> ma.result {
+
+    // if gmem.pcm_frames != nil {
+    //     free(gmem.pcm_frames)
+    // }
     is_looping := ma.sound_is_looping(&gmem.ma_sound)
     ma.sound_uninit(&gmem.ma_sound)
     // Note(jblat): only one file will be in the list
@@ -461,7 +434,6 @@ reinit_sound_decoder_and_waveform_from_file :: proc(filename: cstring ) -> ma.re
 
     { // replace the decoder and generate waveform visualization
         ma.decoder_uninit(&gmem.ma_decoder)
-        free(gmem.pcm_frames)
 
         ma_decoder_config := ma.decoder_config_init(ma.format.f32, 2,  gmem.ma_engine.sampleRate)
         result := ma.decoder_init_file(gmem.sound_audio_filename, &ma_decoder_config, &gmem.ma_decoder)
@@ -469,15 +441,13 @@ reinit_sound_decoder_and_waveform_from_file :: proc(filename: cstring ) -> ma.re
         ma.decoder_get_length_in_pcm_frames(&gmem.ma_decoder, &total_pcm_frames)
 
         sample_rate := gmem.ma_decoder.outputSampleRate
-        gmem.frames_to_read = u64(total_pcm_frames) // seconds
-        channels := gmem.ma_decoder.outputChannels
 
-        gmem.pcm_frames = make([^]f32, total_pcm_frames * u64(channels))
-        total_samples := total_pcm_frames * u64(channels)
+        // gmem.pcm_frames = make([^]f32, total_pcm_frames * u64(gmem.ma_decoder.outputChannels))
+        total_samples := total_pcm_frames * u64(gmem.ma_decoder.outputChannels)
 
-        ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &nb_pcm_frames)
-        gmem.frames_per_waveform_peak = nb_pcm_frames / len(gmem.waveform_samples)
-        samples_per_peak := gmem.frames_per_waveform_peak * u64(channels)
+        ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &gmem.nb_pcm_frames)
+        gmem.frames_per_waveform_peak = gmem.nb_pcm_frames / len(gmem.waveform_samples)
+        samples_per_peak := gmem.frames_per_waveform_peak * u64(gmem.ma_decoder.outputChannels)
 
         for peak, peak_index in gmem.waveform_samples {
             peak_max : f32 = 0.0
@@ -606,7 +576,7 @@ game_update :: proc () {
                             return
                         }
                     }
-                    
+
 
                     populate_directory_array: { // populate the direcotry array
                         current_filepath_str := strings.clone_from_cstring(gmem.sound_audio_filename, context.temp_allocator) // C:\Users\johnb\Music\Japanese Breakfast - Jubilee\Japanese Breakfast - Jubilee - 02 Be Sweet.flac -> C:\Users\johnb\Music\Japanese Breakfast - Jubilee\Japanese Breakfast - Jubilee - 02 Be Sweet.flac\Users\johnb\Music\Japanese Breakfast - JubileeC:\Users\johnb\Music\Japanese Breakfast - Jubilee
@@ -634,7 +604,7 @@ game_update :: proc () {
                         }
                     }
 
-                   
+
                 }
 
                 sdl3.ShowOpenFileDialog(file_dialogue_callback, nil, gmem.sdl_window, &file_filters[0], len(file_filters), "C:\\Users\\", false)
@@ -854,50 +824,108 @@ game_update :: proc () {
         ypos += progress_bar_height + top_padding_for_progress_bar
     }
 
-    { // draw actual media player sprites under progress bar
-        scale_of_buttons : f32 = 2.0
-        dstx : f32 = (f32(screen_width)/2.0) - (media_player_buttons_sprite_width*scale_of_buttons)/2.0
+    { // draw table
+        // PCM Frame | Left Sample | Right Sample
+        column_names := [3]string{"PCM Frame", "Left Sample", "Right Sample"}
 
-        is_sound_playing := ma.sound_is_playing(&gmem.ma_sound)
-        row := i32(SpriteRow.play)
-        col := animated_sprites[.play].curr_frame
-        if !is_sound_playing {
-            row = i32(SpriteRow.pause)
-            col = animated_sprites[.pause].curr_frame
+        nb_rows_to_display : f32 = 20
+        cell_width : f32 = 100
+        font_size : f32 = 12
+        cell_height := font_size * 1.5
+
+        for column_name, column_index in column_names {
+            cell_xpos := xpos + (f32(column_index)*cell_width)
+            render_text(gmem.sdl_renderer, cell_xpos, ypos, font_size, 255,255,255,255, gmem.fonts[1], column_name)
+            r := sdl3.FRect {cell_xpos, ypos, cell_width, cell_height}
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
+            sdl3.RenderRect(gmem.sdl_renderer, &r)
         }
-        render_sprite_clip_from_atlas(gmem.sdl_renderer, gmem.animated_sprite_atlas, row, col, media_player_buttons_sprite_width, media_player_buttons_sprite_height, dstx, ypos, scale_of_buttons )
+        ypos += cell_height
 
-        ypos += media_player_buttons_sprite_height*scale_of_buttons + 5
+        current_pcm_cursor : u64
+        ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_cursor)
+
+        total_samples := gmem.nb_pcm_frames * u64(gmem.ma_decoder.outputChannels)
+        start_pcm_frame_index := current_pcm_cursor * u64(gmem.ma_decoder.outputChannels)
+        start_pcm_frame_index = clamp(start_pcm_frame_index, 0, total_samples)
+        end_pcm_frame_index := start_pcm_frame_index + (u64(nb_rows_to_display) * u64(gmem.ma_decoder.outputChannels))
+        end_pcm_frame_index = clamp(end_pcm_frame_index, 0, total_samples)
+
+        // TODO(johnb): This only works for 2 channel stereo audio
+        // Need to modify so that its dynamic based on number of channels
+        // there will be NChannels + 1 Columns to be displayed. The extra column is for the frame index
+
+        // I think there's really just:
+        // - mono: Sample
+        // - stero: Left Sample, Right Sample
+        // - 5.1  : Front Left, Front Right, Surround Left, Surround Right, Center Front
+        for pcm_frame_index := start_pcm_frame_index; pcm_frame_index < end_pcm_frame_index; pcm_frame_index += 2 {
+            left_sample := gmem.pcm_frames[pcm_frame_index]
+            right_sample := gmem.pcm_frames[pcm_frame_index + 1]
+
+            pcm_frame := pcm_frame_index / u64(gmem.ma_decoder.outputChannels)
+            pcm_frame_index_as_text := fmt.tprintf("%d", pcm_frame)
+            left_sample_as_text := fmt.tprintf("%f", left_sample)
+            right_sample_as_text := fmt.tprintf("%f", right_sample)
+
+            column_values := [3]string{pcm_frame_index_as_text, left_sample_as_text, right_sample_as_text}
+            for val, column_idx in column_values {
+                cell_xpos := xpos + (f32(column_idx)*cell_width)
+                render_text(gmem.sdl_renderer, cell_xpos, ypos, font_size, 255,255,255,255, gmem.fonts[1], val)
+                r := sdl3.FRect {cell_xpos, ypos, cell_width, cell_height}
+                sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
+                sdl3.RenderRect(gmem.sdl_renderer, &r)
+            }
+
+            ypos += cell_height
+        }
+
+        ypos += 10.0 // for padding
+
     }
 
-    { // draw waveform region
-        waveform_padding : i32 = 100
-        waveform_width : i32 = screen_width - waveform_padding*2
-        wave_max_height : f32 =50.0
 
-        current_pcm_frame: u64
-        ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
-        total_pcm_frames: u64
-        ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
-        current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
-        current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
-        end_waveform_range := current_waveform_index + u64(waveform_width)
-        end_waveform_range = min(len(gmem.waveform_left), end_waveform_range)
+    { // draw non-absolute pcm frames as waveform
+        current_pcm_cursor : u64
+        ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_cursor)
+        nb_samples_to_display := 200
+        total_samples := gmem.nb_pcm_frames * u64(gmem.ma_decoder.outputChannels)
+        start_pcm_frame_index := current_pcm_cursor * u64(gmem.ma_decoder.outputChannels)
+        start_pcm_frame_index = clamp(start_pcm_frame_index, 0, total_samples)
+        end_pcm_frame_index := start_pcm_frame_index + (u64(nb_samples_to_display) * u64(gmem.ma_decoder.outputChannels))
+        end_pcm_frame_index = clamp(end_pcm_frame_index, 0, total_samples)
 
-        for peak, offset in gmem.waveform_samples[current_waveform_index:end_waveform_range] {
-            xpos := f32(waveform_padding + i32(offset))
-            y1 := ypos + wave_max_height
-            // y1 := ypos + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
-            y2 := ypos + wave_max_height + (peak * (wave_max_height/2))
-            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,255,255,255)
-            sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, xpos, y2)
+        wave_max_height : f32 = 200.0
+        spacing : f32 = 10.0
+        offset : f32 = 0.0
+        for pcm_frame_index := start_pcm_frame_index; pcm_frame_index < end_pcm_frame_index; pcm_frame_index += 2 {
+            offset += 1.0
+            xpos : f32 =  offset * spacing
+            next_xpos := (offset+1)*spacing
+
+            left_sample := gmem.pcm_frames[pcm_frame_index]
+            next_left_sample := gmem.pcm_frames[pcm_frame_index+2]
+            left_y1 := ypos + (wave_max_height / 2.0 - (left_sample*2) * (wave_max_height/2.0))
+            next_left_y2 := ypos + (wave_max_height / 2.0 - (next_left_sample*2) * (wave_max_height/2.0))
+
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,182,252,255)
+            sdl3.RenderLine(gmem.sdl_renderer, xpos, left_y1, next_xpos, next_left_y2)
+
+            right_sample := gmem.pcm_frames[pcm_frame_index+1]
+            next_right_sample := gmem.pcm_frames[pcm_frame_index+3]
+            right_y1 := ypos + (wave_max_height / 2.0 - (right_sample*2) * (wave_max_height/2.0))
+            next_right_y2 := ypos + (wave_max_height / 2.0 - (next_right_sample*2) * (wave_max_height/2.0))
+
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 252,191,0,255)
+            sdl3.RenderLine(gmem.sdl_renderer, xpos, right_y1, next_xpos, next_right_y2)
         }
 
-        ypos += wave_max_height + 50.0
+        ypos += wave_max_height * 2
     }
 
     { // draw waveform region absolute amplitude
-        waveform_padding : i32 = 100
+        waveform_padding : i32 = 200
+
         waveform_width : i32 = screen_width - waveform_padding*2
         wave_max_height : f32 =50.0
 
@@ -908,7 +936,7 @@ game_update :: proc () {
         current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
         current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
         end_waveform_range := current_waveform_index + u64(waveform_width)
-        end_waveform_range = min(len(gmem.waveform_left), end_waveform_range)
+        end_waveform_range = min(len(gmem.waveform_samples), end_waveform_range)
 
         for peak, offset in gmem.waveform_samples[current_waveform_index:end_waveform_range] {
             peak_abs := math.abs(peak)
@@ -920,46 +948,190 @@ game_update :: proc () {
             sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, xpos, y2)
         }
 
-        ypos += wave_max_height + 50.0
+        ypos += wave_max_height + 20.0
     }
 
-    { // try to draw osciliscopy waveform
-        waveform_padding : i32 = 610
-        waveform_width : i32 = screen_width - waveform_padding*2
-        wave_max_height : f32 = 120.0
+    // { // Draw cool and weird visual
+    //     waveform_padding : i32 = screen_width / 3
+    //     waveform_width : i32 = screen_width - waveform_padding*2
+    //     wave_max_height : f32 = 300.0
 
-        nb_waveform_indices_in_visualization := 20
-        current_pcm_frame: u64
-        ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
-        total_pcm_frames: u64
-        ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
-        current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
-        current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
-        begin_waveform_index := current_waveform_index - u64(nb_waveform_indices_in_visualization/2)
-        begin_waveform_index = clamp(begin_waveform_index, 0, len(gmem.waveform_samples))
-        end_waveform_index := current_waveform_index + u64(nb_waveform_indices_in_visualization/2)
-        end_waveform_index = clamp(end_waveform_index, 0, len(gmem.waveform_samples))
+    //     nb_waveform_indices_in_visualization := 20
+    //     current_pcm_frame: u64
+    //     ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
+    //     total_pcm_frames: u64
+    //     ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
+    //     current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
+    //     current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
+    //     end_waveform_index := current_waveform_index + u64(nb_waveform_indices_in_visualization/2)
+    //     end_waveform_index = clamp(end_waveform_index, 0, len(gmem.waveform_samples))
 
-        index_x_spacing :=  waveform_width /  i32(nb_waveform_indices_in_visualization) // lol i have no idea
-        for i, offset in begin_waveform_index..<end_waveform_index {
-            xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset))
-            next_xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset+1))
-            peak := gmem.waveform_samples[i]
-            if i + 1 >= len(gmem.waveform_samples) {
-                break // gtfo
-            }
-            next_peak := gmem.waveform_samples[i+1]
-            y1 := ypos + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
-            next_y2 := ypos + (wave_max_height / 2.0 - next_peak * (wave_max_height/2.0))
+    //     color := [4]u8{0,0,0,255}
+    //     index_x_spacing :=  waveform_width /  i32(nb_waveform_indices_in_visualization) // lol i have no idea
+    //     for i, offset in current_waveform_index..<end_waveform_index {
+    //         xpos := f32(waveform_padding) + f32(waveform_width*2) - f32(index_x_spacing*i32(offset))
+    //         next_xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset+1))
+    //         peak := gmem.waveform_samples[i]
+    //         if i + 1 >= len(gmem.waveform_samples) {
+    //             break // gtfo
+    //         }
+    //         next_peak := gmem.waveform_samples[i+1]
+    //         y1 := ypos + (wave_max_height / 2.0 - (peak*2) * (wave_max_height/2.0))
+    //         next_y2 := ypos + (wave_max_height / 2.0 - (next_peak*2) * (wave_max_height/2.0))
 
-            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,150,255,255)
-            sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
-        }
+    //         sdl3.SetRenderDrawColor(gmem.sdl_renderer, color.r,color.g,color.b,color.a)
+    //         sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
+    //     }
 
-        ypos += wave_max_height + 10.0
-    }
+    //     for i, offset in current_waveform_index..<end_waveform_index {
+    //         xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset))
+    //         next_xpos := f32(waveform_padding) + f32(waveform_width*2)- f32(index_x_spacing*i32(offset+1))
+    //         peak := -gmem.waveform_samples[i]
+    //         if i + 1 >= len(gmem.waveform_samples) {
+    //             break // gtfo
+    //         }
+    //         next_peak := gmem.waveform_samples[i+1]
+    //         y1 := ypos + (wave_max_height / 2.0 - (peak*2) * (wave_max_height/2.0))
+    //         next_y2 := ypos + (wave_max_height / 2.0 - (next_peak*2) * (wave_max_height/2.0))
 
-    { // try to draw full waveform non-absolute
+    //         sdl3.SetRenderDrawColor(gmem.sdl_renderer, color.r,color.g,color.b,color.a)
+    //         sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
+    //     }
+
+    //     for i, offset in current_waveform_index..<end_waveform_index {
+    //         xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset))
+    //         next_xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset+1))
+    //         peak := gmem.waveform_samples[i]
+    //         if i + 1 >= len(gmem.waveform_samples) {
+    //             break // gtfo
+    //         }
+    //         next_peak := gmem.waveform_samples[i+1]
+    //         y1 := ypos + (wave_max_height / 2.0 - (peak*2) * (wave_max_height/2.0))
+    //         next_y2 := ypos + (wave_max_height / 2.0 - (next_peak*2) * (wave_max_height/2.0))
+
+    //         sdl3.SetRenderDrawColor(gmem.sdl_renderer, color.r,color.g,color.b,color.a)
+    //         sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
+    //     }
+
+    //     for i, offset in current_waveform_index..<end_waveform_index {
+    //         xpos := f32(waveform_padding) +  f32(waveform_width*2) - f32(index_x_spacing*i32(offset))
+    //         next_xpos := f32(waveform_padding)+  f32(waveform_width*2) - f32(index_x_spacing*i32(offset+1))
+    //         peak := gmem.waveform_samples[i]
+    //         if i + 1 >= len(gmem.waveform_samples) {
+    //             break // gtfo
+    //         }
+    //         next_peak := gmem.waveform_samples[i+1]
+    //         y1 := ypos + (wave_max_height / 2.0 - (peak*2) * (wave_max_height/2.0))
+    //         next_y2 := ypos + (wave_max_height / 2.0 - (next_peak*2) * (wave_max_height/2.0))
+
+    //         sdl3.SetRenderDrawColor(gmem.sdl_renderer, color.r,color.g,color.b,color.a)
+    //         sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
+    //     }
+
+    //     ypos += wave_max_height + 10.0
+    // }
+
+    // { // Draw cool and weird 3d like visual
+    //     waveform_padding : i32 = 400
+    //     waveform_width : i32 = screen_width - waveform_padding*2
+    //     wave_max_height : f32 = 120.0
+
+    //     nb_waveform_indices_in_visualization := 20
+    //     current_pcm_frame: u64
+    //     ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
+    //     total_pcm_frames: u64
+    //     ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
+    //     current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
+    //     current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
+    //     end_waveform_index := current_waveform_index + u64(nb_waveform_indices_in_visualization/2)
+    //     end_waveform_index = clamp(end_waveform_index, 0, len(gmem.waveform_samples))
+
+    //     index_x_spacing :=  waveform_width /  i32(nb_waveform_indices_in_visualization) // lol i have no idea
+    //     for i, offset in current_waveform_index..<end_waveform_index {
+    //         xpos := f32(waveform_padding) + f32(waveform_width*2) - f32(index_x_spacing*i32(offset))
+    //         next_xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset+1))
+    //         peak := gmem.waveform_samples[i]
+    //         if i + 1 >= len(gmem.waveform_samples) {
+    //             break // gtfo
+    //         }
+    //         next_peak := gmem.waveform_samples[i+1]
+    //         y1 := ypos + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
+    //         next_y2 := ypos + (wave_max_height / 2.0 - next_peak * (wave_max_height/2.0))
+
+    //         sdl3.SetRenderDrawColor(gmem.sdl_renderer, 150,150,255,255)
+    //         sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
+    //     }
+
+    //     for i, offset in current_waveform_index..<end_waveform_index {
+    //         xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset))
+    //         next_xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset+1))
+    //         peak := gmem.waveform_samples[i]
+    //         if i + 1 >= len(gmem.waveform_samples) {
+    //             break // gtfo
+    //         }
+    //         next_peak := gmem.waveform_samples[i+1]
+    //         y1 := ypos + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
+    //         next_y2 := ypos + (wave_max_height / 2.0 - next_peak * (wave_max_height/2.0))
+
+    //         sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
+    //         sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
+    //     }
+
+    //     ypos += wave_max_height + 10.0
+    // }
+
+    // { // Try to draw osciliscopy waveform
+    //     waveform_padding : i32 = 500
+    //     waveform_width : i32 = screen_width - waveform_padding*2
+    //     wave_max_height : f32 = 120.0
+
+    //     nb_waveform_indices_in_visualization := 40
+    //     current_pcm_frame: u64
+    //     ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
+    //     total_pcm_frames: u64
+    //     ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
+
+    //     current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
+    //     current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
+    //     begin_waveform_index := current_waveform_index - u64(nb_waveform_indices_in_visualization/2)
+    //     begin_waveform_index = clamp(begin_waveform_index, 0, len(gmem.waveform_samples))
+
+    //     index_x_spacing :=  waveform_width /  i32(nb_waveform_indices_in_visualization) // lol i have no idea
+
+    //     for i, offset in begin_waveform_index..<current_waveform_index {
+    //         xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset))
+    //         next_xpos := f32(waveform_padding) + f32(index_x_spacing*i32(offset+1))
+    //         peak := gmem.waveform_samples[i]
+    //         if i + 1 >= len(gmem.waveform_samples) {
+    //             break // gtfo
+    //         }
+    //         next_peak := gmem.waveform_samples[i+1]
+    //         y1 := ypos + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
+    //         next_y2 := ypos + (wave_max_height / 2.0 - next_peak * (wave_max_height/2.0))
+
+    //         sdl3.SetRenderDrawColor(gmem.sdl_renderer, 100,255,100,255)
+    //         sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
+    //     }
+
+    //     for i, offset in begin_waveform_index..<current_waveform_index {
+    //         xpos := f32(waveform_padding) + f32(waveform_width) - f32(index_x_spacing*i32(offset))
+    //         next_xpos := f32(waveform_padding) + f32(waveform_width) - f32(index_x_spacing*i32(offset+1))
+    //         peak := gmem.waveform_samples[i]
+    //         if i + 1 >= len(gmem.waveform_samples) {
+    //             break // gtfo
+    //         }
+    //         next_peak := gmem.waveform_samples[i+1]
+    //         y1 := ypos + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
+    //         next_y2 := ypos + (wave_max_height / 2.0 - next_peak * (wave_max_height/2.0))
+
+    //         sdl3.SetRenderDrawColor(gmem.sdl_renderer, 100,255,100,255)
+    //         sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
+    //     }
+
+    //     ypos += wave_max_height + 10.0
+    // }
+
+    { // draw full waveform non-absolute
         waveform_padding : i32 = 100
         waveform_width : i32 = screen_width - waveform_padding*2
         wave_max_height : f32 =50.0
@@ -988,25 +1160,33 @@ game_update :: proc () {
             sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,150,255,255)
             sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
         }
-
     }
 
-    // just draw all the sprite for demo
-    ypos = f32(screen_height) - (media_player_buttons_sprite_height*2.0) - 10.0
 
-    for animated_sprite, sprite_row in animated_sprites {
-        x := 10.0 + (media_player_buttons_sprite_width*2.0) * f32(sprite_row)
-        render_sprite_clip_from_atlas(gmem.sdl_renderer, gmem.animated_sprite_atlas, i32(sprite_row), animated_sprite.curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height, x, ypos, 2.0)
+    before_render_update_time := sdl3.GetTicks()
+    frame_time_before_render_update := before_render_update_time- update_time_start
+    {
+        render_text_tprintf(gmem.sdl_renderer, f32(screen_width - 400), 0, 16.0, 255, 255,255,255, gmem.fonts[1], "frame time: %d ms", frame_time_before_render_update)
     }
 
-    update_time_end := sdl3.GetTicks()
-
-    frame_time := update_time_end - update_time_start
-    // {
-    //     render_text_tprintf(gmem.sdl_renderer, f32(screen_width - 400), 0, 16.0, 255, 255,255,255, gmem.fonts[1], "frame time: %d ms", frame_time)
-    // }
+    frame_time_after_render_update := sdl3.GetTicks()
+    time_spent_rendering := frame_time_after_render_update - before_render_update_time
+    fmt.printfln("time spent rendering: %v",time_spent_rendering)
 
     sdl3.RenderPresent(gmem.sdl_renderer)
     free_all(context.temp_allocator)
-    sdl3.Delay(u32(math.floor(f32(1000.0/60.0))))
+    update_time_end := sdl3.GetTicks()
+
+    frame_time := update_time_end - update_time_start
+
+
+    max_frame_time := u32(math.floor(f32(1000.0/60.0)))
+    delay_time := max_frame_time - u32(frame_time)
+    delay_time = min(max_frame_time, delay_time)
+
+    if delay_time > max_frame_time {
+        fmt.printfln("wrong!")
+    }
+
+    sdl3.Delay(delay_time)
 }
