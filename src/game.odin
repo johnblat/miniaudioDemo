@@ -239,16 +239,17 @@ game_init :: proc () {
         os2.exit(1)
     }
 
-    default_audio_filename := "ASSETS/unlimited.mp3"
+    default_audio_filename : cstring = "ASSETS/unlimited.mp3"
     // Note(johnb): all filenames are allocated with default allocator and then intented to be deleted before replacing
     // The reason is that currently, only one filename is really active at a time
     // in the future, i may display a bunch of filenames in the app in a library.
     // At that point, i will have all of those share the same lifetime.
     // In the more near future, i may try to pull song details like the track name, artist, or genre since
     // that is nice to display in a media player
-    gmem.sound_audio_filename = strings.clone_to_cstring(default_audio_filename)
+    // Eventually, i want this replaced with some kind of id
+    gmem.sound_audio_filename = cstring(make([^]u8, 0))
 
-    result := reinit_sound_decoder_and_waveform_from_file(gmem.sound_audio_filename)
+    result := reinit_sound_decoder_and_waveform_from_file(default_audio_filename)
     if result != .SUCCESS {
         fmt.printfln("[miniaudio] sound initialization from file failed")
         os2.exit(1)
@@ -445,7 +446,10 @@ reinit_sound_decoder_and_waveform_from_file :: proc(filename: cstring ) -> ma.re
         // gmem.pcm_frames = make([^]f32, total_pcm_frames * u64(gmem.ma_decoder.outputChannels))
         total_samples := total_pcm_frames * u64(gmem.ma_decoder.outputChannels)
 
-        ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &gmem.nb_pcm_frames)
+        read_pcm_frames_result := ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &gmem.nb_pcm_frames)
+        if read_pcm_frames_result != .SUCCESS {
+            fmt.printfln("[miniaudio] read pcm frames failed: %v", read_pcm_frames_result)
+        }
         gmem.frames_per_waveform_peak = gmem.nb_pcm_frames / len(gmem.waveform_samples)
         samples_per_peak := gmem.frames_per_waveform_peak * u64(gmem.ma_decoder.outputChannels)
 
@@ -701,31 +705,31 @@ game_update :: proc () {
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 30, 30, 30, 255, gmem.fonts[1], "pcm frames: %d / %d", curr_pcm_frame, length_in_pcm_frames)
     ypos += font_size * line_spacing_scale
 
-    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "bpm: %.2f", gmem.bpm)
-    ypos += font_size * line_spacing_scale
+    // render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "bpm: %.2f", gmem.bpm)
+    // ypos += font_size * line_spacing_scale
 
 
-    curr_beat := i32(seconds * (gmem.bpm / seconds_in_minute))
-    total_beats := i32(length * (gmem.bpm / seconds_in_minute))
-    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 50, 50, 50, 255, gmem.fonts[1], "beats: %d / %d", curr_beat, total_beats)
-    ypos += font_size * line_spacing_scale
+    // curr_beat := i32(seconds * (gmem.bpm / seconds_in_minute))
+    // total_beats := i32(length * (gmem.bpm / seconds_in_minute))
+    // render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 50, 50, 50, 255, gmem.fonts[1], "beats: %d / %d", curr_beat, total_beats)
+    // ypos += font_size * line_spacing_scale
 
-    beats_in_measure : i32 : 4
-    curr_measure := curr_beat / beats_in_measure
-    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "measure: %d", curr_measure)
-    ypos += font_size * line_spacing_scale
+    // beats_in_measure : i32 : 4
+    // curr_measure := curr_beat / beats_in_measure
+    // render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "measure: %d", curr_measure)
+    // ypos += font_size * line_spacing_scale
 
-    render_text(gmem.sdl_renderer, xpos, ypos, font_size, 200, 200, 0, 255, gmem.fonts[1], "metronome: ")
-    beat_in_measure := curr_beat %% beats_in_measure
-    for i in 0..<beat_in_measure+1 {
-        spacing : f32 = 10
-        size := font_size
-        beat_x := xpos + 250 + f32(i)*(size + spacing)
-        r := sdl3.FRect{beat_x, ypos, size, size}
-        sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,0,0,255)
-        sdl3.RenderFillRect(gmem.sdl_renderer, &r)
-    }
-    ypos += font_size * line_spacing_scale
+    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 200, 200, 0, 255, gmem.fonts[1], "metronome: ")
+    // beat_in_measure := curr_beat %% beats_in_measure
+    // for i in 0..<beat_in_measure+1 {
+    //     spacing : f32 = 10
+    //     size := font_size
+    //     beat_x := xpos + 250 + f32(i)*(size + spacing)
+    //     r := sdl3.FRect{beat_x, ypos, size, size}
+    //     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,0,0,255)
+    //     sdl3.RenderFillRect(gmem.sdl_renderer, &r)
+    // }
+    // ypos += font_size * line_spacing_scale
 
     { // volume
         volume := ma.engine_get_volume(&gmem.ma_engine)
@@ -1210,7 +1214,7 @@ game_update :: proc () {
 
     frame_time_after_render_update := sdl3.GetTicks()
     time_spent_rendering := frame_time_after_render_update - before_render_update_time
-    fmt.printfln("time spent rendering: %v",time_spent_rendering)
+    // fmt.printfln("time spent rendering: %v",time_spent_rendering)
 
     sdl3.RenderPresent(gmem.sdl_renderer)
     free_all(context.temp_allocator)
