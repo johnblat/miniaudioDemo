@@ -243,16 +243,16 @@ main :: proc() {
 	// 	// libc.getchar()
 	// }
 
-	for &g in old_game_apis {
-		// FIXME(johnb): This breaks when there are any old game apis
-		unload_game_api(&g)
-	}
+	// for &g in old_game_apis {
+	// 	// FIXME(johnb): This breaks when there are any old game apis
+	// 	unload_game_api(&g)
+	// }
 
 	delete(old_game_apis)
 
 	game_api.shutdown_window()
 	// TODO(johnb): this broke for some reason
-	unload_game_api(&game_api)
+	//unload_game_api(&game_api)
 	// mem.tracking_allocator_destroy(&tracking_allocator)
 }
 
