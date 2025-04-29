@@ -1,3 +1,5 @@
+@echo off
+
 if not exist build mkdir build
 set name=miniaudio-example
 
@@ -27,5 +29,7 @@ if not exist "SDL3.lib" (
 		exit /b 1
 	)
 )
+
+xcopy /y /e /i assets build\assets > nul
 
 odin build src/main_default -debug -out:%OUT_DIR%\%name%.exe
