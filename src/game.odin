@@ -34,7 +34,7 @@ Game_Memory :: struct {
     nb_pcm_frames: u64,
     waveform_samples: [1024*10]f32,
     frames_per_waveform_peak: u64,
-    sound_audio_filename: cstring,
+    current_filename_index: int,
     current_directory_audio_filenames_arena: vmem.Arena,
     current_directory_audio_filenames: sa.Small_Array(64, cstring),
     bpm: f32,
@@ -64,7 +64,7 @@ game_memory_size :: proc() -> int {
 
 Input_State :: enum {up, pressed, down, released}
 Input_Command :: enum {play_toggle, force_hot_reload, force_build_and_hot_reload, force_restart, restart_sound}
-Input_App_Key :: enum {Enter, LeftShift, RightShift, F5, F6, F7}
+Input_App_Key :: enum {Enter, LeftShift, RightShift, LeftCtrl, F5, F6, F7}
 
 TTF_CHAR_AT_START : i32 :  32
 TTF_CHAR_AMOUNT : i32 : 95
@@ -247,7 +247,36 @@ game_init :: proc () {
     // In the more near future, i may try to pull song details like the track name, artist, or genre since
     // that is nice to display in a media player
     // Eventually, i want this replaced with some kind of id
-    gmem.sound_audio_filename = cstring(make([^]u8, 0))
+    // gmem.sound_audio_filename = cstring(make([^]u8, 0))
+
+    { // populate the direcotry array
+        current_filepath_str := strings.clone_from_cstring(default_audio_filename, context.temp_allocator)
+        directory_of_selected_song := filepath.dir(current_filepath_str, context.temp_allocator)
+        files_in_dir, err := os2.read_directory_by_path(directory_of_selected_song, sa.cap(gmem.current_directory_audio_filenames), context.temp_allocator)
+        if err != nil {
+            fmt.printfln("[os/os2]: Error generating directory list: %v", err)
+        }
+        vmem.arena_free_all(&gmem.current_directory_audio_filenames_arena)
+        for path_info, idx in files_in_dir {
+            path := path_info.fullpath
+            fmt.printfln("path: %v", path)
+            if os2.is_dir(path) {
+                continue
+            }
+            ext := filepath.ext(path)
+            supported_audio_extensions := [?]string{".mp3", ".wav", ".flac"}
+            _, is_supported_audio_extension := slice.linear_search(supported_audio_extensions[:], ext)
+            if !is_supported_audio_extension {
+                continue
+            }
+            if path == string(default_audio_filename) {
+                gmem.current_filename_index = idx
+            }
+            arena_allocator := vmem.arena_allocator(&gmem.current_directory_audio_filenames_arena)
+            path_cstring := strings.clone_to_cstring(path, arena_allocator)
+            sa.append_elem(&gmem.current_directory_audio_filenames, path_cstring)
+        }
+    }
 
     result := reinit_sound_decoder_and_waveform_from_file(default_audio_filename)
     if result != .SUCCESS {
@@ -426,18 +455,12 @@ reinit_sound_decoder_and_waveform_from_file :: proc(filename: cstring ) -> ma.re
     ma.sound_start(&gmem.ma_sound)
     ma.sound_set_looping(&gmem.ma_sound, is_looping)
 
-    delete(gmem.sound_audio_filename)
-    size_filename := len(filename)
-    cstr := make([]byte, size_filename + 1)
-    cstr[len(cstr)-1] = 0
-    gmem.sound_audio_filename = cstring(&cstr[0])
-    mem.copy(rawptr(gmem.sound_audio_filename), rawptr(filename), size_filename)
 
     { // replace the decoder and generate waveform visualization
         ma.decoder_uninit(&gmem.ma_decoder)
 
         ma_decoder_config := ma.decoder_config_init(ma.format.f32, 2,  gmem.ma_engine.sampleRate)
-        result := ma.decoder_init_file(gmem.sound_audio_filename, &ma_decoder_config, &gmem.ma_decoder)
+        result := ma.decoder_init_file(filename, &ma_decoder_config, &gmem.ma_decoder)
         total_pcm_frames: u64
         ma.decoder_get_length_in_pcm_frames(&gmem.ma_decoder, &total_pcm_frames)
 
@@ -478,6 +501,10 @@ reinit_sound_decoder_and_waveform_from_file :: proc(filename: cstring ) -> ma.re
 
 @(export)
 game_update :: proc () {
+    @(static) should_draw_table := false
+    @(static) should_draw_weird_visual := false
+    req_go_to_next_track := false
+    req_go_to_prev_track := false
     update_time_start := sdl3.GetTicks()
     actual_screen_width, actual_screen_height: i32
     sdl3.GetWindowSize(gmem.sdl_window, &actual_screen_width, &actual_screen_height)
@@ -504,6 +531,9 @@ game_update :: proc () {
             } else if sdl_event.key.scancode == .LSHIFT {
                 input_app_keys_is_down[.LeftShift] = true
             }
+            else if sdl_event.key.scancode == .LCTRL {
+                input_app_keys_is_down[.LeftCtrl] = true
+            }
             else if sdl_event.key.scancode == .RSHIFT {
                 ma.sound_seek_to_pcm_frame(&gmem.ma_sound, 0)
                 ma.sound_start(&gmem.ma_sound)
@@ -520,6 +550,12 @@ game_update :: proc () {
             }
             else if sdl_event.key.scancode == .LEFT && input_app_keys_is_down[.LeftShift] {
                 ma_seek_quarter_notes(quarter_note_duration, -4.0)
+            }
+
+            if sdl_event.key.scancode == .RIGHT && input_app_keys_is_down[.LeftCtrl] {
+                req_go_to_next_track = true
+            } else if sdl_event.key.scancode == .LEFT && input_app_keys_is_down[.LeftCtrl]{
+                req_go_to_prev_track = true
             }
 
             is_volume_up_button_pressed := sdl_event.key.scancode == .UP
@@ -543,11 +579,20 @@ game_update :: proc () {
                 }
             }
 
-
             is_loop_toggle_button_pressed := sdl_event.key.scancode == .L
             if is_loop_toggle_button_pressed {
                 is_looping := ma.sound_is_looping(&gmem.ma_sound)
                 ma.sound_set_looping(&gmem.ma_sound, !is_looping)
+            }
+
+            is_show_table_toggle_button_pressed := sdl_event.key.scancode == .T
+            if is_show_table_toggle_button_pressed {
+                should_draw_table = !should_draw_table
+            }
+
+            is_show_weird_visual_toggle_button_pressed := sdl_event.key.scancode == .W
+            if is_show_weird_visual_toggle_button_pressed {
+                should_draw_weird_visual = !should_draw_weird_visual
             }
 
             is_open_file_dialogue_button_pressed := sdl_event.key.scancode == .F
@@ -573,38 +618,40 @@ game_update :: proc () {
                             result_description := ma.result_description(result)
                             fmt.printfln("[miniaudio] sound failed to init from file: %s. result: %s", filelist[0], result_description)
                             str := "audio file failed to load: "
-                            strs := [?]string{str, string(gmem.sound_audio_filename)}
-                            final_str := strings.join(strs[:], "", context.temp_allocator)
-                            delete(gmem.sound_audio_filename)
-                            gmem.sound_audio_filename = strings.clone_to_cstring(final_str)
+                            // TODO(johnb): Actually do something useful, like show some kind of message
                             return
                         }
                     }
 
 
-                    populate_directory_array: { // populate the direcotry array
-                        current_filepath_str := strings.clone_from_cstring(gmem.sound_audio_filename, context.temp_allocator) // C:\Users\johnb\Music\Japanese Breakfast - Jubilee\Japanese Breakfast - Jubilee - 02 Be Sweet.flac -> C:\Users\johnb\Music\Japanese Breakfast - Jubilee\Japanese Breakfast - Jubilee - 02 Be Sweet.flac\Users\johnb\Music\Japanese Breakfast - JubileeC:\Users\johnb\Music\Japanese Breakfast - Jubilee
-                        directory_of_selected_song := filepath.dir(current_filepath_str, context.temp_allocator) //C:\Users\johnb\Music\Japanese Breakfast - Jubilee
-                        files_in_dir, err := os2.read_directory_by_path(directory_of_selected_song, sa.cap(gmem.current_directory_audio_filenames), context.temp_allocator) // {data=0x000001298106c141 "C:\\Users\\johnb\\Music\\Japanese Breakfast - Jubilee\\AlbumArtSmall.jpgC:\\Users\\johnb\\Music\\Japanese Breakfast - Jubilee\\AlbumArt_{B5020207-474E-4720-B009-3B6D3E62C700}_Large.jpgC:\\Users\\johnb\\Music\\Japan... ...}
+                    { // populate the directory array
+                        directory_of_selected_song := filepath.dir(string(filelist[0]), context.temp_allocator)
+                        files_in_dir, err := os2.read_directory_by_path(directory_of_selected_song, sa.cap(gmem.current_directory_audio_filenames), context.temp_allocator)
                         if err != nil {
                             fmt.printfln("[os/os2]: Error generating directory list: %v", err)
                         }
                         vmem.arena_free_all(&gmem.current_directory_audio_filenames_arena)
-                        x: for path_info in files_in_dir {
+                        sa.clear(&gmem.current_directory_audio_filenames)
+                        for path_info in files_in_dir {
                             path := path_info.fullpath
                             fmt.printfln("path: %v", path)
                             if os2.is_dir(path) {
-                                continue x
+                                continue
                             }
                             ext := filepath.ext(path)
                             supported_audio_extensions := [?]string{".mp3", ".wav", ".flac"}
                             _, is_supported_audio_extension := slice.linear_search(supported_audio_extensions[:], ext)
                             if !is_supported_audio_extension {
-                                continue x
+                                continue
                             }
+                            
                             arena_allocator := vmem.arena_allocator(&gmem.current_directory_audio_filenames_arena)
                             path_cstring := strings.clone_to_cstring(path, arena_allocator)
                             sa.append_elem(&gmem.current_directory_audio_filenames, path_cstring)
+                            idx := sa.len(gmem.current_directory_audio_filenames) - 1
+                            if path == string(filelist[0]) {
+                                gmem.current_filename_index = idx
+                            }
                         }
                     }
 
@@ -619,6 +666,8 @@ game_update :: proc () {
                 input_app_keys_is_down[.Enter] = false
             } else if sdl_event.key.scancode == .LSHIFT {
                 input_app_keys_is_down[.LeftShift] = false
+            } else if sdl_event.key.scancode == .LCTRL {
+                input_app_keys_is_down[.LeftCtrl] = false
             }
         }
 
@@ -642,18 +691,23 @@ game_update :: proc () {
 
     { // handle going to next song
         is_sound_finished := gmem.ma_sound.atEnd
-        if is_sound_finished {
-            for idx in 1..< sa.len(gmem.current_directory_audio_filenames) {
-                prev_idx := idx - 1
-                prev_filename := sa.get(gmem.current_directory_audio_filenames, prev_idx)
-                curr_filename := sa.get(gmem.current_directory_audio_filenames, idx)
-                if prev_filename == gmem.sound_audio_filename {
-                    result := reinit_sound_decoder_and_waveform_from_file(curr_filename)
-                    if result != .SUCCESS {
-                        fmt.printfln("[miniaudio] failed reinit %v", result)
-                    }
-                    break
-                }
+        go_to_next_track := is_sound_finished || req_go_to_next_track
+        if go_to_next_track {
+            gmem.current_filename_index = (gmem.current_filename_index + 1) %% gmem.current_directory_audio_filenames.len
+            curr_filename := sa.get(gmem.current_directory_audio_filenames, gmem.current_filename_index)
+            result := reinit_sound_decoder_and_waveform_from_file(curr_filename)
+            if result != .SUCCESS {
+                fmt.printfln("[miniaudio] failed reinit %v", result)
+            }
+        }
+
+        go_to_prev_track := req_go_to_prev_track
+        if go_to_prev_track {
+            gmem.current_filename_index = (gmem.current_filename_index - 1) %% gmem.current_directory_audio_filenames.len
+            curr_filename := sa.get(gmem.current_directory_audio_filenames, gmem.current_filename_index)
+            result := reinit_sound_decoder_and_waveform_from_file(curr_filename)
+            if result != .SUCCESS {
+                fmt.printfln("[miniaudio] failed reinit %v", result)
             }
         }
     }
@@ -684,11 +738,12 @@ game_update :: proc () {
     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 120, 100, 0, 255)
     sdl3.RenderClear(gmem.sdl_renderer)
 
-    font_size : f32 = 12
+    font_size : f32 = 24
     line_spacing_scale : f32 = 1.1
     xpos : f32 = 1
     ypos : f32 = 1
-    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 100, 0, 0, 255, gmem.fonts[1], "filename: %v", gmem.sound_audio_filename)
+    current_audio_filename := sa.get(gmem.current_directory_audio_filenames, gmem.current_filename_index)
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 100, 0, 0, 255, gmem.fonts[1], "filename: %v", current_audio_filename)
     ypos += font_size * line_spacing_scale
 
     seconds : f32
@@ -830,7 +885,7 @@ game_update :: proc () {
 
     panel_width : f32 = f32(screen_width) / 2
     max_panel_row_height : f32 = 0
-    { // draw table
+    if should_draw_table { // draw table
         y_cursor := ypos + 10.0
 
         // PCM Frame | Left Sample | Right Sample
@@ -838,7 +893,7 @@ game_update :: proc () {
 
         nb_rows_to_display : f32 = 20
         cell_width : f32 = panel_width / 3
-        font_size : f32 = 12
+        font_size : f32 = 20
         cell_height := font_size * 1.5
 
         for column_name, column_index in column_names {
@@ -911,7 +966,7 @@ game_update :: proc () {
         end_pcm_frame_index := start_pcm_frame_index + (u64(nb_samples_to_display) * u64(gmem.ma_decoder.outputChannels))
         end_pcm_frame_index = clamp(end_pcm_frame_index, 0, total_samples)
 
-        wave_max_height : f32 = 200.0
+        wave_max_height : f32 = 300.0
         y_cursor := ypos + wave_max_height/2.0
 
         spacing : f32 = panel_width / nb_samples_to_display
@@ -956,7 +1011,7 @@ game_update :: proc () {
 
     { // draw waveform region absolute amplitude
         waveform_width : i32 = i32(waveform_long_panel_width)
-        wave_max_height : f32 =50.0
+        wave_max_height : f32 =120.0
 
         current_pcm_frame: u64
         ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
@@ -985,7 +1040,7 @@ game_update :: proc () {
 
     { // draw full waveform non-absolute
         waveform_width : i32 = i32(waveform_long_panel_width)
-        wave_max_height : f32 =50.0
+        wave_max_height : f32 =120.0
 
         nb_waveform_indices_in_visualization := waveform_width
         current_pcm_frame: u64
@@ -1020,9 +1075,10 @@ game_update :: proc () {
     waveform_long_panel_rect := sdl3.FRect{xpos, ypos, waveform_long_panel_width, waveform_long_panel_height }
     sdl3.RenderRect(gmem.sdl_renderer, &waveform_long_panel_rect)
 
-    { // Draw cool and weird visual
-        waveform_padding : i32 = screen_width / 3
-        waveform_width : i32 = screen_width - waveform_padding*2
+    if should_draw_weird_visual { // Draw cool and weird visual
+        ypos : f32 = 240
+        waveform_padding : i32 = 20
+        waveform_width : i32 = 300
         wave_max_height : f32 = 300.0
 
         nb_waveform_indices_in_visualization := 20
