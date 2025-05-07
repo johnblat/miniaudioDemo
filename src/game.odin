@@ -7,6 +7,7 @@ import "core:math"
 import "core:mem"
 import "core:os/os2"
 import "core:strings"
+import "core:strconv"
 import "core:path/filepath"
 import "core:slice"
 import "base:runtime"
@@ -21,9 +22,9 @@ breakpoint :: intrinsics.debug_trap
 should_run := true
 
 Game_Memory :: struct {
-    ma_engine: ma.engine,
-    ma_sound :ma.sound,
-    ma_decoder: ma.decoder,
+    ma_engine  : ma.engine,
+    ma_sound   : ma.sound,
+    ma_decoder : ma.decoder,
     // Note(johb): Although this is called pcm_frames, this is a copy of a fully decoded
     // audio stream, so really, each index is a sample. It's called that, cause its what miniaudio calls it.
     // A call to ma.sound_get_cursor_in_pcm_frames will need to be scaled by number of channels
@@ -38,10 +39,17 @@ Game_Memory :: struct {
     current_directory_audio_filenames_arena: vmem.Arena,
     current_directory_audio_filenames: sa.Small_Array(64, cstring),
     bpm: f32,
+    offset: f32,
     fonts :[3]Font,
     sdl_renderer: ^sdl3.Renderer,
     sdl_window: ^sdl3.Window,
     animated_sprite_atlas: ^sdl3.Texture,
+
+    // UI STATE
+    // bpm_digit_buffer         : [5]int,
+    selected_bpm_digit       : int,
+    // offset_digit_buffer      : [6]int,
+    selected_offset_digit    : int,
 }
 
 Font :: struct {
@@ -64,7 +72,7 @@ game_memory_size :: proc() -> int {
 
 Input_State :: enum {up, pressed, down, released}
 Input_Command :: enum {play_toggle, force_hot_reload, force_build_and_hot_reload, force_restart, restart_sound}
-Input_App_Key :: enum {Enter, LeftShift, RightShift, LeftCtrl, F5, F6, F7}
+Input_App_Key :: enum {Enter, LeftShift, RightShift, LeftCtrl, F5, F6, F7, B, V, S, O}
 
 TTF_CHAR_AT_START : i32 :  32
 TTF_CHAR_AMOUNT : i32 : 95
@@ -159,7 +167,6 @@ animated_sprites := [SpriteRow]Frame_Animation {
         nb_frames = 8,
         ping_pong = true,
     },
-
 }
 
 sprite_atlas_src_rect_clip :: proc (texture: ^sdl3.Texture, row, col: i32, frame_width, frame_height: f32) -> sdl3.FRect {
@@ -239,16 +246,13 @@ game_init :: proc () {
         os2.exit(1)
     }
 
-    default_audio_filename : cstring = "ASSETS/unlimited.mp3"
-    // Note(johnb): all filenames are allocated with default allocator and then intented to be deleted before replacing
-    // The reason is that currently, only one filename is really active at a time
-    // in the future, i may display a bunch of filenames in the app in a library.
-    // At that point, i will have all of those share the same lifetime.
-    // In the more near future, i may try to pull song details like the track name, artist, or genre since
-    // that is nice to display in a media player
-    // Eventually, i want this replaced with some kind of id
-    // gmem.sound_audio_filename = cstring(make([^]u8, 0))
+    when ODIN_DEBUG {
+        default_allocator := context.allocator
+        mem.tracking_allocator_init(&track, default_allocator)
+        context.allocator = mem.tracking_allocator(&track)
+    }
 
+    default_audio_filename : cstring = "C:\\Users\\johnb\\Music\\Modest Mouse - We Were Dead Before The Ship Even Sank\\Modest Mouse - We Were Dead Before The Ship Even Sank - 02 Dashboard.flac"
     { // populate the direcotry array
         current_filepath_str := strings.clone_from_cstring(default_audio_filename, context.temp_allocator)
         directory_of_selected_song := filepath.dir(current_filepath_str, context.temp_allocator)
@@ -284,17 +288,13 @@ game_init :: proc () {
         os2.exit(1)
     }
 
-    // sound_init_result := ma.sound_init_from_file(&gmem.ma_engine, gmem.sound_audio_filename, {.DECODE}, nil, nil, &gmem.ma_sound)
-    // if sound_init_result != .SUCCESS {
-    //     fmt.printfln("[miniaudio] sound initialization from file failed")
-    //     os2.exit(1)
-    // }
+    gmem.bpm = 136
+    gmem.offset = 0.16
 
-    sound_start_result := ma.sound_start(&gmem.ma_sound)
-    if sound_start_result != .SUCCESS {
-        fmt.printfln("[miniaudio] sound start failed")
-    }
-    gmem.bpm = 162
+    // gmem.bpm_digit_buffer   = { 1, 3, 6, 0, 0 }
+    gmem.selected_bpm_digit       = 2
+    // gmem.offset_digit_buffer     = {0, 0, 0, 1, 6, 0}
+    gmem.selected_offset_digit    = 3
 
     x, y, channels_in_file: i32
     img_bytes := img.load("assets/MediaPlayerButtons.png", &x, &y, &channels_in_file, 4)
@@ -452,7 +452,7 @@ reinit_sound_decoder_and_waveform_from_file :: proc(filename: cstring ) -> ma.re
     ma.sound_uninit(&gmem.ma_sound)
     // Note(jblat): only one file will be in the list
     result := ma.sound_init_from_file(&gmem.ma_engine, filename, {.DECODE}, nil, nil, &gmem.ma_sound)
-    ma.sound_start(&gmem.ma_sound)
+    // ma.sound_start(&gmem.ma_sound)
     ma.sound_set_looping(&gmem.ma_sound, is_looping)
 
 
@@ -466,7 +466,6 @@ reinit_sound_decoder_and_waveform_from_file :: proc(filename: cstring ) -> ma.re
 
         sample_rate := gmem.ma_decoder.outputSampleRate
 
-        // gmem.pcm_frames = make([^]f32, total_pcm_frames * u64(gmem.ma_decoder.outputChannels))
         total_samples := total_pcm_frames * u64(gmem.ma_decoder.outputChannels)
 
         read_pcm_frames_result := ma.decoder_read_pcm_frames(&gmem.ma_decoder, &gmem.pcm_frames[0], total_pcm_frames, &gmem.nb_pcm_frames)
@@ -499,19 +498,130 @@ reinit_sound_decoder_and_waveform_from_file :: proc(filename: cstring ) -> ma.re
     return ma.result.SUCCESS
 }
 
+set_input_state :: proc(scancode : sdl3.Scancode, val : bool) {
+    // Note(jblat): Why mix sdl events and my input_app_keys_is_down code? Why not just use one or the other?
+    // If a user is holding a key, SDL will keep sending KEYDOWN events after like half a second. This is common
+    // for things like text editing. In this app, when seeking forwards and backwards, i want that behavior.
+    // Since SDL already does that, i use it in addition to code i have for tracking if an input is already down
+    // That way we can have key chord type shortcuts WITH the sdl behavior
+    if scancode == .RETURN {
+        input_app_keys_is_down[.Enter] = val
+    }
+    else if scancode == .LSHIFT {
+        input_app_keys_is_down[.LeftShift] = val
+    }
+    else if scancode == .LCTRL {
+        input_app_keys_is_down[.LeftCtrl] = val
+    }
+    else if scancode == .B {
+        input_app_keys_is_down[.B] = val
+    }
+    else if scancode == .V {
+        input_app_keys_is_down[.V] = val
+    }
+    else if scancode == .S {
+        input_app_keys_is_down[.S] = val
+    }
+    else if scancode == .O {
+        input_app_keys_is_down[.O] = val
+    }
+}
+
+digit_buffer :: proc (buffer : []int, selected_digit : ^int, scancode : sdl3.Scancode) {
+    move_modifying_digit_right_scancode_pressed := scancode == .RIGHT
+    move_modifying_digit_left_scancode_pressed  := scancode == .LEFT
+    increase_digit_value_scancode_pressed       := scancode == .UP
+    decrease_digit_value_scancode_pressed       := scancode == .DOWN
+
+    move_modifiable_digit_right := move_modifying_digit_right_scancode_pressed
+    move_modifiable_digit_left  := move_modifying_digit_left_scancode_pressed
+    increase_digit              := increase_digit_value_scancode_pressed
+    decrease_digit              := decrease_digit_value_scancode_pressed
+
+    if move_modifiable_digit_right {
+        selected_digit^ += 1
+        selected_digit^ = selected_digit^ %% len(buffer)
+    }
+
+    if move_modifiable_digit_left {
+        selected_digit^ -= 1
+        selected_digit^ = selected_digit^ %% len(buffer)
+    }
+
+    if increase_digit {
+        buffer[selected_digit^] += 1
+        if selected_digit^ != 0 {
+            if buffer[selected_digit^] >= 10 {
+                higher_digit := selected_digit^ - 1
+                buffer[higher_digit] += 1
+                buffer[higher_digit] = buffer[higher_digit] %% 10
+            }
+        }
+        buffer[selected_digit^] = buffer[selected_digit^] %% 10
+    }
+
+    if decrease_digit {
+        buffer[selected_digit^] -= 1
+        if selected_digit^ != 0 {
+            if buffer[selected_digit^] <= 0 {
+                higher_digit := selected_digit^ - 1
+                buffer[higher_digit] -= 1
+                buffer[higher_digit] = buffer[higher_digit] %% 10
+                buffer[selected_digit^] = 9
+            }
+        }
+        buffer[selected_digit^] = buffer[selected_digit^] %% 10
+    }
+}
+
+
+power_of_ten_digit_adjust :: proc (val: ^f32, power_of_ten : ^int, hi, lo : int, scancode : sdl3.Scancode) {
+    move_modifying_digit_right_scancode_pressed := scancode == .RIGHT
+    move_modifying_digit_left_scancode_pressed  := scancode == .LEFT
+    increase_digit_value_scancode_pressed       := scancode == .UP
+    decrease_digit_value_scancode_pressed       := scancode == .DOWN
+
+    move_modifiable_digit_right := move_modifying_digit_right_scancode_pressed
+    move_modifiable_digit_left  := move_modifying_digit_left_scancode_pressed
+    increase_digit              := increase_digit_value_scancode_pressed
+    decrease_digit              := decrease_digit_value_scancode_pressed
+
+    if move_modifiable_digit_right {
+        power_of_ten^ -= 1
+        power_of_ten^ = math.clamp(power_of_ten^, lo, hi)
+    }
+
+    if move_modifiable_digit_left {
+        power_of_ten^ += 1
+        power_of_ten^ = math.clamp(power_of_ten^, lo, hi)
+    }
+
+    amount_to_change := math.pow10(f32(power_of_ten^))
+
+    if increase_digit {
+        val^ += amount_to_change
+    }
+    if decrease_digit {
+        val^ -= amount_to_change
+    }
+}
+
 @(export)
 game_update :: proc () {
-    @(static) should_draw_table := false
+    @(static) should_draw_table        := false
     @(static) should_draw_weird_visual := false
+    @(static) modify_bpm_mode          := false
+
+
     req_go_to_next_track := false
     req_go_to_prev_track := false
     update_time_start := sdl3.GetTicks()
     actual_screen_width, actual_screen_height: i32
-    sdl3.GetWindowSize(gmem.sdl_window, &actual_screen_width, &actual_screen_height)
+    sdl3.GetWindowSize(gmem.sdl_window, &screen_width, &screen_height)
     scale_width := f32(actual_screen_width) / f32(screen_width)
     scale_height := f32(actual_screen_height) / f32(screen_height)
 
-    sdl3.SetRenderScale(gmem.sdl_renderer, scale_width, scale_height)
+    // sdl3.SetRenderScale(gmem.sdl_renderer, scale_width, scale_height)
     seconds_in_minute : f32 = 60.0
     quarter_note_duration := seconds_in_minute / gmem.bpm
 
@@ -520,28 +630,21 @@ game_update :: proc () {
     mem.copy(&prev_input_app_keys_is_down, &input_app_keys_is_down, size_of(input_app_keys_is_down))
 
     for sdl3.PollEvent(&sdl_event) {
-        if sdl_event.type == .KEY_DOWN {
-            // Note(jblat): Why mix sdl events and my input_app_keys_is_down code? Why not just use one or the other?
-            // If a user is holding a key, SDL will keep sending KEYDOWN events after like half a second. This is common
-            // for things like text editing. In this app, when seeking forwards and backwards, i want that behavior.
-            // Since SDL already does that, i use it in addition to code i have for tracking if an input is already down
-            // That way we can have key chord type shortcuts WITH the sdl behavior
-            if sdl_event.key.scancode == .RETURN {
-                input_app_keys_is_down[.Enter] = true
-            } else if sdl_event.key.scancode == .LSHIFT {
-                input_app_keys_is_down[.LeftShift] = true
-            }
-            else if sdl_event.key.scancode == .LCTRL {
-                input_app_keys_is_down[.LeftCtrl] = true
-            }
-            else if sdl_event.key.scancode == .RSHIFT {
+        if sdl_event.type == .KEY_DOWN
+        {
+            set_input_state(sdl_event.key.scancode, true)
+
+            seek_quarter_note_button_held := input_app_keys_is_down[.S]
+            seek_measure_button_held := input_app_keys_is_down[.LeftShift]
+
+            if sdl_event.key.scancode == .RSHIFT {
                 ma.sound_seek_to_pcm_frame(&gmem.ma_sound, 0)
                 ma.sound_start(&gmem.ma_sound)
             }
-            else if sdl_event.key.scancode == .RIGHT && !input_app_keys_is_down[.LeftShift] {
+            else if sdl_event.key.scancode == .RIGHT && !seek_measure_button_held && seek_quarter_note_button_held {
                 ma_seek_quarter_notes(quarter_note_duration, 1.0)
             }
-            else if sdl_event.key.scancode == .LEFT && !input_app_keys_is_down[.LeftShift] {
+            else if sdl_event.key.scancode == .LEFT && !seek_measure_button_held && seek_quarter_note_button_held{
                 ma_seek_quarter_notes(quarter_note_duration, -1.0)
             }
 
@@ -558,8 +661,22 @@ game_update :: proc () {
                 req_go_to_prev_track = true
             }
 
+            modify_bpm_button_held := input_app_keys_is_down[.B]
+            if modify_bpm_button_held {
+                power_of_ten_digit_adjust(&gmem.bpm, &gmem.selected_bpm_digit, 2,-2, sdl_event.key.scancode)
+                // digit_buffer(gmem.bpm_digit_buffer[:], &gmem.selected_bpm_digit, sdl_event.key.scancode)
+            }
+
+            modify_offset_button_held := input_app_keys_is_down[.O]
+            if modify_offset_button_held {
+                power_of_ten_digit_adjust(&gmem.offset, &gmem.selected_offset_digit, 2,-3, sdl_event.key.scancode)
+                // digit_buffer(gmem.offset_digit_buffer[:], &gmem.selected_offset_digit, sdl_event.key.scancode)
+            }
+
+            is_volume_modify_button_held := input_app_keys_is_down[.V]
             is_volume_up_button_pressed := sdl_event.key.scancode == .UP
-            if is_volume_up_button_pressed {
+            increase_volume := is_volume_modify_button_held && is_volume_up_button_pressed
+            if increase_volume {
                 curr_volume := ma.engine_get_volume(&gmem.ma_engine)
                 new_volume := curr_volume + 0.1
                 new_volume = min(1.0, new_volume)
@@ -570,7 +687,8 @@ game_update :: proc () {
             }
 
             is_volume_down_button_presesd := sdl_event.key.scancode == .DOWN
-            if is_volume_down_button_presesd {
+            decrease_volume := is_volume_modify_button_held && is_volume_down_button_presesd
+            if decrease_volume {
                 curr_volume := ma.engine_get_volume(&gmem.ma_engine)
                 new_volume := curr_volume - 0.1
                 result := ma.engine_set_volume(&gmem.ma_engine, new_volume)
@@ -597,20 +715,18 @@ game_update :: proc () {
 
             is_open_file_dialogue_button_pressed := sdl_event.key.scancode == .F
             if is_open_file_dialogue_button_pressed {
-                file_filters := [?]sdl3.DialogFileFilter{
-                    {name = "Supported Audio Files", pattern = "mp3;wav;flac"},
-                    {name = "MP3 File",  pattern = "mp3"},
-                    {name = "WAV File",  pattern = "wav"},
-                    {name = "FLAC File", pattern = "flac"},
-                }
 
                 file_dialogue_callback :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: c.int) {
                     context = context
-                    // context.allocator = tracking_allocator
-                    is_no_file_selected := filelist[0] == nil
-                    if is_no_file_selected {
-                        return
+                    context.allocator = mem.tracking_allocator(&track)
+
+                    { // back out
+                        is_no_file_selected := filelist[0] == nil
+                        if is_no_file_selected {
+                            return
+                        }
                     }
+
                     { // reinit stuff
                         result := reinit_sound_decoder_and_waveform_from_file(filelist[0])
                         // TODO(jblat): is this the best way to handle this type of error?
@@ -621,6 +737,7 @@ game_update :: proc () {
                             // TODO(johnb): Actually do something useful, like show some kind of message
                             return
                         }
+                        ma.sound_start(&gmem.ma_sound)
                     }
 
 
@@ -630,8 +747,10 @@ game_update :: proc () {
                         if err != nil {
                             fmt.printfln("[os/os2]: Error generating directory list: %v", err)
                         }
+
                         vmem.arena_free_all(&gmem.current_directory_audio_filenames_arena)
                         sa.clear(&gmem.current_directory_audio_filenames)
+
                         for path_info in files_in_dir {
                             path := path_info.fullpath
                             fmt.printfln("path: %v", path)
@@ -644,7 +763,7 @@ game_update :: proc () {
                             if !is_supported_audio_extension {
                                 continue
                             }
-                            
+
                             arena_allocator := vmem.arena_allocator(&gmem.current_directory_audio_filenames_arena)
                             path_cstring := strings.clone_to_cstring(path, arena_allocator)
                             sa.append_elem(&gmem.current_directory_audio_filenames, path_cstring)
@@ -654,21 +773,21 @@ game_update :: proc () {
                             }
                         }
                     }
+                }
 
-
+                file_filters := [?]sdl3.DialogFileFilter{
+                    {name = "Supported Audio Files", pattern = "mp3;wav;flac"},
+                    {name = "MP3 File",  pattern = "mp3"},
+                    {name = "WAV File",  pattern = "wav"},
+                    {name = "FLAC File", pattern = "flac"},
                 }
 
                 sdl3.ShowOpenFileDialog(file_dialogue_callback, nil, gmem.sdl_window, &file_filters[0], len(file_filters), "C:\\Users\\", false)
             }
         }
-        else if sdl_event.type == .KEY_UP {
-            if sdl_event.key.scancode == .RETURN {
-                input_app_keys_is_down[.Enter] = false
-            } else if sdl_event.key.scancode == .LSHIFT {
-                input_app_keys_is_down[.LeftShift] = false
-            } else if sdl_event.key.scancode == .LCTRL {
-                input_app_keys_is_down[.LeftCtrl] = false
-            }
+        else if sdl_event.type == .KEY_UP
+        {
+            set_input_state(sdl_event.key.scancode, false)
         }
 
         if sdl_event.type == .WINDOW_CLOSE_REQUESTED {
@@ -689,7 +808,19 @@ game_update :: proc () {
         }
     }
 
-    { // handle going to next song
+    // { // convert bpm buffer to bpm float
+    //     integer_part := gmem.bpm_digit_buffer[0]*100 + gmem.bpm_digit_buffer[1]*10 + gmem.bpm_digit_buffer[2]
+    //     decimal_part := gmem.bpm_digit_buffer[3]*10 + gmem.bpm_digit_buffer[4]
+    //     gmem.bpm = f32(integer_part) + f32(decimal_part)/100.0
+    // }
+
+    // { // convert offset buffer to offset float
+    //     integer_part := gmem.offset_digit_buffer[0]*100 + gmem.offset_digit_buffer[1]*10 + gmem.offset_digit_buffer[2]
+    //     decimal_part := gmem.offset_digit_buffer[3]*100 + gmem.offset_digit_buffer[4]*10 + gmem.offset_digit_buffer[5]
+    //     gmem.offset = f32(integer_part) + f32(decimal_part)/1000.0
+    // }
+
+    { // handle going to next or prev song
         is_sound_finished := gmem.ma_sound.atEnd
         go_to_next_track := is_sound_finished || req_go_to_next_track
         if go_to_next_track {
@@ -699,6 +830,7 @@ game_update :: proc () {
             if result != .SUCCESS {
                 fmt.printfln("[miniaudio] failed reinit %v", result)
             }
+            ma.sound_start(&gmem.ma_sound)
         }
 
         go_to_prev_track := req_go_to_prev_track
@@ -709,6 +841,7 @@ game_update :: proc () {
             if result != .SUCCESS {
                 fmt.printfln("[miniaudio] failed reinit %v", result)
             }
+            ma.sound_start(&gmem.ma_sound)
         }
     }
 
@@ -746,11 +879,11 @@ game_update :: proc () {
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 100, 0, 0, 255, gmem.fonts[1], "filename: %v", current_audio_filename)
     ypos += font_size * line_spacing_scale
 
-    seconds : f32
+    curr_cursor_seconds : f32
     length : f32
-    ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &seconds)
+    ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &curr_cursor_seconds)
     ma.sound_get_length_in_seconds(&gmem.ma_sound, &length)
-    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 0, 0, 0, 255, gmem.fonts[1], "seconds: %.4f / %.4f", seconds, length)
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 0, 0, 0, 255, gmem.fonts[1], "seconds: %.4f / %.4f", curr_cursor_seconds, length)
     ypos += font_size * line_spacing_scale
 
     curr_pcm_frame : u64
@@ -760,31 +893,142 @@ game_update :: proc () {
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 30, 30, 30, 255, gmem.fonts[1], "pcm frames: %d / %d", curr_pcm_frame, length_in_pcm_frames)
     ypos += font_size * line_spacing_scale
 
-    // render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "bpm: %.2f", gmem.bpm)
-    // ypos += font_size * line_spacing_scale
+    {
+        is_bpm_modify_button_held := input_app_keys_is_down[.B]
+        if is_bpm_modify_button_held {
+            bpm_text := fmt.tprintf("%06.2f", gmem.bpm)
+            highlight_bpm_digit_rect := sdl3.FRect{}
+            font_scale := font_size / gmem.fonts[1].font_line_height
+            bpm_int_part_str := fmt.tprintf("%d", int(gmem.bpm))
+            nb_int_digits := len(bpm_int_part_str)
+            bpm_char_index := nb_int_digits - 1 - gmem.selected_bpm_digit
+
+            if bpm_char_index >= 3 {
+                bpm_char_index += 1 // account for the '.'
+            }
+
+            highlight_rect := sdl3.FRect{}
+            xpos2 : f32 = 0
+            for i in 0..<len(bpm_text) {
+                if i32(bpm_text[i]) >= TTF_CHAR_AT_START && i32(bpm_text[i]) < TTF_CHAR_AT_START + TTF_CHAR_AMOUNT + 1 {
+                    info := gmem.fonts[1].font_packed_chars[i32(bpm_text[i]) - TTF_CHAR_AT_START]
+                    src := sdl3.FRect{f32(info.x0), f32(info.y0), f32(info.x1) - f32(info.x0), f32(info.y1) - f32(info.y0)}
+                    highlight_rect = sdl3.FRect{
+                        xpos2 + f32(info.xoff) * font_scale,
+                        (ypos + f32(info.yoff) * font_scale) + font_size,
+                        f32(info.x1 - info.x0) * font_scale,
+                        f32(info.y1 - info.y0) * font_scale,
+                    }
+
+                    xpos2 += f32(info.xadvance) * font_scale
+                    if i == bpm_char_index {
+                        break
+                    }
+                }
+            }
+
+            bpm_label := "bpm: "
+            render_text_length : f32 = 0
+            for i in 0..<len(bpm_label) {
+                if i32(bpm_label[i]) >= TTF_CHAR_AT_START && i32(bpm_label[i]) < TTF_CHAR_AT_START + TTF_CHAR_AMOUNT + 1 {
+                    info := gmem.fonts[1].font_packed_chars[i32(bpm_label[i]) - TTF_CHAR_AT_START]
+                    src := sdl3.FRect{f32(info.x0), f32(info.y0), f32(info.x1) - f32(info.x0), f32(info.y1) - f32(info.y0)}
+                    render_text_length += f32(info.xadvance) * font_scale
+                }
+            }
+
+            highlight_rect.x += render_text_length + xpos
+            highlight_rect.x -= 1
+            highlight_rect.y -= 1
+            highlight_rect.w += 2
+            highlight_rect.h += 2
+
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
+            sdl3.RenderFillRect(gmem.sdl_renderer, &highlight_rect)
+        }
+    }
 
 
-    // curr_beat := i32(seconds * (gmem.bpm / seconds_in_minute))
-    // total_beats := i32(length * (gmem.bpm / seconds_in_minute))
-    // render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 50, 50, 50, 255, gmem.fonts[1], "beats: %d / %d", curr_beat, total_beats)
-    // ypos += font_size * line_spacing_scale
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "bpm: %06.2f", gmem.bpm)
+    ypos += font_size * line_spacing_scale
 
-    // beats_in_measure : i32 : 4
-    // curr_measure := curr_beat / beats_in_measure
-    // render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "measure: %d", curr_measure)
-    // ypos += font_size * line_spacing_scale
+    {
+        is_offset_modify_button_held := input_app_keys_is_down[.O]
+        if is_offset_modify_button_held {
+            offset_text := fmt.tprintf("%07.3f", gmem.offset)
+            highlight_offset_digit_rect := sdl3.FRect{}
+            font_scale := font_size / gmem.fonts[1].font_line_height
+            offset_char_index := gmem.selected_offset_digit
 
-    // render_text(gmem.sdl_renderer, xpos, ypos, font_size, 200, 200, 0, 255, gmem.fonts[1], "metronome: ")
-    // beat_in_measure := curr_beat %% beats_in_measure
-    // for i in 0..<beat_in_measure+1 {
-    //     spacing : f32 = 10
-    //     size := font_size
-    //     beat_x := xpos + 250 + f32(i)*(size + spacing)
-    //     r := sdl3.FRect{beat_x, ypos, size, size}
-    //     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,0,0,255)
-    //     sdl3.RenderFillRect(gmem.sdl_renderer, &r)
-    // }
-    // ypos += font_size * line_spacing_scale
+            if offset_char_index >= 3 {
+                offset_char_index += 1 // account for the '.'
+            }
+
+            highlight_rect := sdl3.FRect{}
+            xpos2 : f32 = 0
+            for i in 0..<len(offset_text) {
+                if i32(offset_text[i]) >= TTF_CHAR_AT_START && i32(offset_text[i]) < TTF_CHAR_AT_START + TTF_CHAR_AMOUNT + 1 {
+                    info := gmem.fonts[1].font_packed_chars[i32(offset_text[i]) - TTF_CHAR_AT_START]
+                    src := sdl3.FRect{f32(info.x0), f32(info.y0), f32(info.x1) - f32(info.x0), f32(info.y1) - f32(info.y0)}
+                    highlight_rect = sdl3.FRect{
+                        xpos2 + f32(info.xoff) * font_scale,
+                        (ypos + f32(info.yoff) * font_scale) + font_size,
+                        f32(info.x1 - info.x0) * font_scale,
+                        f32(info.y1 - info.y0) * font_scale,
+                    }
+
+                    xpos2 += f32(info.xadvance) * font_scale
+                    if i == offset_char_index {
+                        break
+                    }
+                }
+            }
+
+            offset_label := "offset: "
+            render_text_length : f32 = 0
+            for i in 0..<len(offset_label) {
+                if i32(offset_label[i]) >= TTF_CHAR_AT_START && i32(offset_label[i]) < TTF_CHAR_AT_START + TTF_CHAR_AMOUNT + 1 {
+                    info := gmem.fonts[1].font_packed_chars[i32(offset_label[i]) - TTF_CHAR_AT_START]
+                    src := sdl3.FRect{f32(info.x0), f32(info.y0), f32(info.x1) - f32(info.x0), f32(info.y1) - f32(info.y0)}
+                    render_text_length += f32(info.xadvance) * font_scale
+                }
+            }
+
+            highlight_rect.x += render_text_length + xpos
+            highlight_rect.x -= 1
+            highlight_rect.y -= 1
+            highlight_rect.w += 2
+            highlight_rect.h += 2
+
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
+            sdl3.RenderFillRect(gmem.sdl_renderer, &highlight_rect)
+        }
+    }
+
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "offset: %07.3f", gmem.offset)
+    ypos += font_size * line_spacing_scale
+
+    curr_beat := i32( gmem.offset + (curr_cursor_seconds * (gmem.bpm / seconds_in_minute) ) )
+    total_beats := i32(gmem.offset + (length * (gmem.bpm / seconds_in_minute)) )
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 50, 50, 50, 255, gmem.fonts[1], "beats: %d / %d", curr_beat, total_beats)
+    ypos += font_size * line_spacing_scale
+
+    beats_in_measure : i32 : 4
+    curr_measure := curr_beat / beats_in_measure
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "measure: %d", curr_measure)
+    ypos += font_size * line_spacing_scale
+
+    render_text(gmem.sdl_renderer, xpos, ypos, font_size, 200, 200, 0, 255, gmem.fonts[1], "metronome: ")
+    beat_in_measure := curr_beat %% beats_in_measure
+    for i in 0..<beat_in_measure+1 {
+        spacing : f32 = 10
+        size := font_size
+        beat_x := xpos + 250 + f32(i)*(size + spacing)
+        r := sdl3.FRect{beat_x, ypos, size, size}
+        sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,0,0,255)
+        sdl3.RenderFillRect(gmem.sdl_renderer, &r)
+    }
+    ypos += font_size * line_spacing_scale
 
     { // volume
         volume := ma.engine_get_volume(&gmem.ma_engine)
@@ -883,27 +1127,36 @@ game_update :: proc () {
         ypos += progress_bar_height + top_padding_for_progress_bar
     }
 
-    panel_width : f32 = f32(screen_width) / 2
+
+    panel_layout_row_height : f32 = 500.0
+    panel_layout_col_width : f32 = f32(screen_width) / 2
+    panel_layout_at_x : f32 = 0
+    panel_layout_at_y : f32 = ypos
+
     max_panel_row_height : f32 = 0
     if should_draw_table { // draw table
-        y_cursor := ypos + 10.0
+        column_names := [?]string{"PCM Frame", "Left Sample", "Right Sample"}
 
-        // PCM Frame | Left Sample | Right Sample
-        column_names := [3]string{"PCM Frame", "Left Sample", "Right Sample"}
+        font_size : f32 = 20.0
+        font_padding : f32 = 1.5
 
-        nb_rows_to_display : f32 = 20
-        cell_width : f32 = panel_width / 3
-        font_size : f32 = 20
-        cell_height := font_size * 1.5
+        table_layout_row_height := font_size * font_padding
+        table_layout_col_width := panel_layout_col_width / len(column_names)
+        table_layout_at_y : f32 = panel_layout_at_y
+        table_layout_at_x : f32 = panel_layout_at_x
 
         for column_name, column_index in column_names {
-            cell_xpos := xpos + (f32(column_index)*cell_width)
-            render_text(gmem.sdl_renderer, cell_xpos, y_cursor, font_size, 255,255,255,255, gmem.fonts[1], column_name)
-            r := sdl3.FRect {cell_xpos, y_cursor, cell_width, cell_height}
+            render_text(gmem.sdl_renderer, table_layout_at_x, table_layout_at_y, font_size, 255,255,255,255, gmem.fonts[1], column_name)
+            r := sdl3.FRect {table_layout_at_x, table_layout_at_y, table_layout_col_width, table_layout_row_height}
             sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
             sdl3.RenderRect(gmem.sdl_renderer, &r)
+
+            table_layout_at_x += table_layout_col_width
         }
-        y_cursor += cell_height
+
+        // next row
+        table_layout_at_x = panel_layout_at_x
+        table_layout_at_y += table_layout_row_height
 
         current_pcm_cursor : u64
         ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_cursor)
@@ -911,8 +1164,9 @@ game_update :: proc () {
         total_samples := gmem.nb_pcm_frames * u64(gmem.ma_decoder.outputChannels)
         start_pcm_frame_index := current_pcm_cursor * u64(gmem.ma_decoder.outputChannels)
         start_pcm_frame_index = clamp(start_pcm_frame_index, 0, total_samples)
-        end_pcm_frame_index := start_pcm_frame_index + (u64(nb_rows_to_display) * u64(gmem.ma_decoder.outputChannels))
-        end_pcm_frame_index = clamp(end_pcm_frame_index, 0, total_samples)
+
+        // end_pcm_frame_index := start_pcm_frame_index + (u64(nb_rows_to_display) * u64(gmem.ma_decoder.outputChannels))
+        // end_pcm_frame_index = clamp(end_pcm_frame_index, 0, total_samples)
 
         // TODO(johnb): This only works for 2 channel stereo audio
         // Need to modify so that its dynamic based on number of channels
@@ -922,7 +1176,10 @@ game_update :: proc () {
         // - mono: Sample
         // - stero: Left Sample, Right Sample
         // - 5.1  : Front Left, Front Right, Surround Left, Surround Right, Center Front
-        for pcm_frame_index := start_pcm_frame_index; pcm_frame_index < end_pcm_frame_index; pcm_frame_index += 2 {
+        for pcm_frame_index := start_pcm_frame_index; table_layout_at_y < panel_layout_at_y + (panel_layout_row_height-table_layout_row_height); pcm_frame_index += 2 {
+            if pcm_frame_index >= total_samples {
+                break
+            }
             left_sample := gmem.pcm_frames[pcm_frame_index]
             right_sample := gmem.pcm_frames[pcm_frame_index + 1]
 
@@ -933,28 +1190,28 @@ game_update :: proc () {
 
             column_values := [3]string{pcm_frame_index_as_text, left_sample_as_text, right_sample_as_text}
             for val, column_idx in column_values {
-                cell_xpos := xpos + (f32(column_idx)*cell_width)
-                render_text(gmem.sdl_renderer, cell_xpos, y_cursor, font_size, 255,255,255,255, gmem.fonts[1], val)
-                r := sdl3.FRect {cell_xpos, y_cursor, cell_width, cell_height}
+                render_text(gmem.sdl_renderer, table_layout_at_x, table_layout_at_y, font_size, 255,255,255,255, gmem.fonts[1], val)
+                r := sdl3.FRect {table_layout_at_x, table_layout_at_y, table_layout_col_width, table_layout_row_height}
                 sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
                 sdl3.RenderRect(gmem.sdl_renderer, &r)
+
+                // next column
+                table_layout_at_x += table_layout_col_width
             }
 
-            y_cursor += cell_height
+            // next row
+            table_layout_at_x = panel_layout_at_x
+            table_layout_at_y += table_layout_row_height
         }
-
-        y_cursor += 10.0 // for padding
-
-        max_panel_row_height = y_cursor - ypos
     }
 
     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 150,150,150,255)
-    panel_rect := sdl3.FRect{xpos, ypos, panel_width, max_panel_row_height}
+    panel_rect := sdl3.FRect{xpos, ypos, panel_layout_col_width, panel_layout_row_height}
     sdl3.RenderRect(gmem.sdl_renderer, &panel_rect)
 
-    non_absolute_pcm_frame_waveform_panel_height : f32 = 0
 
-    x_cursor := xpos + panel_width
+    // next column
+    panel_layout_at_x += panel_layout_col_width
 
     { // draw non-absolute pcm frames as waveform
         current_pcm_cursor : u64
@@ -966,52 +1223,51 @@ game_update :: proc () {
         end_pcm_frame_index := start_pcm_frame_index + (u64(nb_samples_to_display) * u64(gmem.ma_decoder.outputChannels))
         end_pcm_frame_index = clamp(end_pcm_frame_index, 0, total_samples)
 
-        wave_max_height : f32 = 300.0
-        y_cursor := ypos + wave_max_height/2.0
+        wave_max_absolute_height_in_either_direction : f32 = 200.0
 
-        spacing : f32 = panel_width / nb_samples_to_display
+        panel_mid_y := panel_layout_at_y + wave_max_absolute_height_in_either_direction/2.0
+
+        spacing : f32 = panel_layout_col_width / nb_samples_to_display
         offset : f32 = 0.0
         for pcm_frame_index := start_pcm_frame_index; pcm_frame_index < end_pcm_frame_index; pcm_frame_index += 2 {
             offset += 1.0
-            xpos : f32 = x_cursor + offset * spacing
-            next_xpos := x_cursor + (offset+1)*spacing
+            xpos : f32 = panel_layout_at_x + offset * spacing
+            next_xpos := panel_layout_at_x + (offset+1)*spacing
 
             left_sample := gmem.pcm_frames[pcm_frame_index]
             next_left_sample := gmem.pcm_frames[pcm_frame_index+2]
-            left_y1 := y_cursor + (wave_max_height / 2.0 - (left_sample*2) * (wave_max_height/2.0))
-            next_left_y2 := y_cursor + (wave_max_height / 2.0 - (next_left_sample*2) * (wave_max_height/2.0))
+            left_y1 := panel_mid_y + (wave_max_absolute_height_in_either_direction / 2.0 - (left_sample*2) * (wave_max_absolute_height_in_either_direction/2.0))
+            next_left_y2 := panel_mid_y + (wave_max_absolute_height_in_either_direction / 2.0 - (next_left_sample*2) * (wave_max_absolute_height_in_either_direction/2.0))
 
             sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,182,252,255)
             sdl3.RenderLine(gmem.sdl_renderer, xpos, left_y1, next_xpos, next_left_y2)
 
             right_sample := gmem.pcm_frames[pcm_frame_index+1]
             next_right_sample := gmem.pcm_frames[pcm_frame_index+3]
-            right_y1 := y_cursor + (wave_max_height / 2.0 - (right_sample*2) * (wave_max_height/2.0))
-            next_right_y2 := y_cursor + (wave_max_height / 2.0 - (next_right_sample*2) * (wave_max_height/2.0))
+            right_y1 := panel_mid_y + (wave_max_absolute_height_in_either_direction / 2.0 - (right_sample*2) * (wave_max_absolute_height_in_either_direction/2.0))
+            next_right_y2 := panel_mid_y + (wave_max_absolute_height_in_either_direction / 2.0 - (next_right_sample*2) * (wave_max_absolute_height_in_either_direction/2.0))
 
             sdl3.SetRenderDrawColor(gmem.sdl_renderer, 252,191,0,255)
             sdl3.RenderLine(gmem.sdl_renderer, xpos, right_y1, next_xpos, next_right_y2)
         }
-        non_absolute_pcm_frame_waveform_panel_height = wave_max_height*2.0
     }
 
-    max_panel_row_height = max(non_absolute_pcm_frame_waveform_panel_height, max_panel_row_height)
-
     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 150,150,150,255)
-    non_absolute_pcm_frame_waveform_panel_rect := sdl3.FRect{x_cursor, ypos, panel_width, max_panel_row_height}
+    non_absolute_pcm_frame_waveform_panel_rect := sdl3.FRect{panel_layout_at_x, panel_layout_at_y, panel_layout_col_width, panel_layout_row_height}
     sdl3.RenderRect(gmem.sdl_renderer, &non_absolute_pcm_frame_waveform_panel_rect)
 
+    // next panel row
+    panel_layout_at_x = 0
+    panel_layout_at_y += panel_layout_row_height
 
-    ypos += max_panel_row_height
+    // change dimension
+    panel_layout_row_height = 120.0
 
-    waveform_long_panel_width : f32 = f32(screen_width)/2.0
-    waveform_long_panel_height : f32 = 0
-
-    y_cursor := ypos
 
     { // draw waveform region absolute amplitude
-        waveform_width : i32 = i32(waveform_long_panel_width)
-        wave_max_height : f32 =120.0
+        wave_max_height : f32 = panel_layout_row_height
+
+        y_midpoint := panel_layout_at_y
 
         current_pcm_frame: u64
         ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
@@ -1019,28 +1275,32 @@ game_update :: proc () {
         ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
         current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
         current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
-        end_waveform_range := current_waveform_index + u64(waveform_width)
+        end_waveform_range := current_waveform_index + u64(panel_layout_col_width)
         end_waveform_range = min(len(gmem.waveform_samples), end_waveform_range)
 
         for peak, offset in gmem.waveform_samples[current_waveform_index:end_waveform_range] {
             peak_abs := math.abs(peak)
             xpos := f32(i32(offset))
-            // y1 := ypos + wave_max_height
-            y1 := y_cursor + (wave_max_height / 2.0 - peak_abs * (wave_max_height/2.0))
-            y2 := y_cursor + (wave_max_height/2) + (peak_abs * (wave_max_height/2))
+            y1 := y_midpoint + (wave_max_height / 2.0 - peak_abs * (wave_max_height/2.0))
+            y2 := y_midpoint + (wave_max_height/2) + (peak_abs * (wave_max_height/2))
             sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,255,255,255)
             sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, xpos, y2)
         }
-
-        waveform_long_panel_height += wave_max_height
-
-        y_cursor += wave_max_height
     }
 
+    sdl3.SetRenderDrawColor(gmem.sdl_renderer, 150,150,150,255)
+    r2 := sdl3.FRect{panel_layout_at_x, panel_layout_at_y, panel_layout_col_width, panel_layout_row_height}
+    sdl3.RenderRect(gmem.sdl_renderer, &r2)
+
+    // next panel row
+    panel_layout_at_x = 0
+    panel_layout_at_y += panel_layout_row_height
 
     { // draw full waveform non-absolute
-        waveform_width : i32 = i32(waveform_long_panel_width)
-        wave_max_height : f32 =120.0
+        waveform_width : i32 = i32(panel_layout_col_width)
+        wave_max_height : f32 = panel_layout_row_height
+
+        y_midpoint := panel_layout_at_y
 
         nb_waveform_indices_in_visualization := waveform_width
         current_pcm_frame: u64
@@ -1060,20 +1320,17 @@ game_update :: proc () {
                 break // gtfo
             }
             next_peak := gmem.waveform_samples[i+1]
-            y1 := y_cursor + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
-            next_y2 := y_cursor + (wave_max_height / 2.0 - next_peak * (wave_max_height/2.0))
+            y1 := y_midpoint + (wave_max_height / 2.0 - peak * (wave_max_height/2.0))
+            next_y2 := y_midpoint + (wave_max_height / 2.0 - next_peak * (wave_max_height/2.0))
 
             sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,150,255,255)
             sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
         }
-
-        y_cursor += wave_max_height
-        waveform_long_panel_height += wave_max_height
     }
 
     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 150,150,150,255)
-    waveform_long_panel_rect := sdl3.FRect{xpos, ypos, waveform_long_panel_width, waveform_long_panel_height }
-    sdl3.RenderRect(gmem.sdl_renderer, &waveform_long_panel_rect)
+    r := sdl3.FRect{panel_layout_at_x, panel_layout_at_y, panel_layout_col_width, panel_layout_row_height}
+    sdl3.RenderRect(gmem.sdl_renderer, &r)
 
     if should_draw_weird_visual { // Draw cool and weird visual
         ypos : f32 = 240
@@ -1155,8 +1412,6 @@ game_update :: proc () {
 
         ypos += wave_max_height + 10.0
     }
-
-    ypos += waveform_long_panel_height + 20.0
 
     // { // Draw cool and weird 3d like visual
     //     waveform_padding : i32 = 400
