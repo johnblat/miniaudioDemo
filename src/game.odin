@@ -604,6 +604,65 @@ power_of_ten_digit_adjust :: proc (val: ^f32, power_of_ten : ^int, hi, lo : int,
     if decrease_digit {
         val^ -= amount_to_change
     }
+
+    max_val := f32(math.pow(10, f32(hi+1)) - 1) + f32(math.pow(10, f32(math.abs(lo))) - 1) / math.pow(10, f32(math.abs(lo)))
+
+    val^ = math.clamp(val^, 0, max_val)
+
+}
+
+//%07.3f
+render_highlight_digit_f32 :: proc(val: f32, x_offset, y_offset, font_size: f32, font: Font, label: string, nb_digits, nb_decimals, selected_digit: int) {
+    fmt_string := fmt.tprintf("%%0%d.%df", nb_digits, nb_decimals)
+    bpm_text := fmt.tprintf(fmt_string, val)
+    font_scale := font_size / font.font_line_height
+    a := int(math.log10(f32(math.abs(val)))) + 1
+    nb_int_digits := a < nb_digits - 1- nb_decimals ? nb_digits - 1 - nb_decimals : a
+    bpm_int_part_str := fmt.tprintf("%03d", int(val))
+    // nb_int_digits := len(bpm_int_part_str)
+    char_index := nb_int_digits - 1 - selected_digit
+
+    if char_index >= nb_int_digits {
+        char_index += 1 // account for the '.'
+    }
+
+    highlight_rect := sdl3.FRect{}
+    xpos : f32 = x_offset
+    for i in 0..<len(bpm_text) {
+        if i32(bpm_text[i]) >= TTF_CHAR_AT_START && i32(bpm_text[i]) < TTF_CHAR_AT_START + TTF_CHAR_AMOUNT + 1 {
+            info := font.font_packed_chars[i32(bpm_text[i]) - TTF_CHAR_AT_START]
+            src := sdl3.FRect{f32(info.x0), f32(info.y0), f32(info.x1) - f32(info.x0), f32(info.y1) - f32(info.y0)}
+            highlight_rect = sdl3.FRect{
+                xpos + f32(info.xoff) * font_scale,
+                (y_offset + f32(info.yoff) * font_scale) + font_size,
+                f32(info.x1 - info.x0) * font_scale,
+                f32(info.y1 - info.y0) * font_scale,
+            }
+
+            xpos += f32(info.xadvance) * font_scale
+            if i == char_index {
+                break
+            }
+        }
+    }
+
+    render_text_length : f32 = 0
+    for i in 0..<len(label) {
+        if i32(label[i]) >= TTF_CHAR_AT_START && i32(label[i]) < TTF_CHAR_AT_START + TTF_CHAR_AMOUNT + 1 {
+            info := font.font_packed_chars[i32(label[i]) - TTF_CHAR_AT_START]
+            src := sdl3.FRect{f32(info.x0), f32(info.y0), f32(info.x1) - f32(info.x0), f32(info.y1) - f32(info.y0)}
+            render_text_length += f32(info.xadvance) * font_scale
+        }
+    }
+
+    highlight_rect.x += render_text_length + x_offset
+    highlight_rect.x -= 1
+    highlight_rect.y -= 1
+    highlight_rect.w += 2
+    highlight_rect.h += 2
+
+    sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
+    sdl3.RenderFillRect(gmem.sdl_renderer, &highlight_rect)
 }
 
 @(export)
@@ -664,13 +723,11 @@ game_update :: proc () {
             modify_bpm_button_held := input_app_keys_is_down[.B]
             if modify_bpm_button_held {
                 power_of_ten_digit_adjust(&gmem.bpm, &gmem.selected_bpm_digit, 2,-2, sdl_event.key.scancode)
-                // digit_buffer(gmem.bpm_digit_buffer[:], &gmem.selected_bpm_digit, sdl_event.key.scancode)
             }
 
             modify_offset_button_held := input_app_keys_is_down[.O]
             if modify_offset_button_held {
                 power_of_ten_digit_adjust(&gmem.offset, &gmem.selected_offset_digit, 2,-3, sdl_event.key.scancode)
-                // digit_buffer(gmem.offset_digit_buffer[:], &gmem.selected_offset_digit, sdl_event.key.scancode)
             }
 
             is_volume_modify_button_held := input_app_keys_is_down[.V]
@@ -867,7 +924,6 @@ game_update :: proc () {
         }
     }
 
-
     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 120, 100, 0, 255)
     sdl3.RenderClear(gmem.sdl_renderer)
 
@@ -876,6 +932,7 @@ game_update :: proc () {
     xpos : f32 = 1
     ypos : f32 = 1
     current_audio_filename := sa.get(gmem.current_directory_audio_filenames, gmem.current_filename_index)
+
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 100, 0, 0, 255, gmem.fonts[1], "filename: %v", current_audio_filename)
     ypos += font_size * line_spacing_scale
 
@@ -883,6 +940,7 @@ game_update :: proc () {
     length : f32
     ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &curr_cursor_seconds)
     ma.sound_get_length_in_seconds(&gmem.ma_sound, &length)
+
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 0, 0, 0, 255, gmem.fonts[1], "seconds: %.4f / %.4f", curr_cursor_seconds, length)
     ypos += font_size * line_spacing_scale
 
@@ -890,119 +948,21 @@ game_update :: proc () {
     length_in_pcm_frames : u64
     ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &curr_pcm_frame)
     ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &length_in_pcm_frames)
+
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 30, 30, 30, 255, gmem.fonts[1], "pcm frames: %d / %d", curr_pcm_frame, length_in_pcm_frames)
     ypos += font_size * line_spacing_scale
 
-    {
-        is_bpm_modify_button_held := input_app_keys_is_down[.B]
-        if is_bpm_modify_button_held {
-            bpm_text := fmt.tprintf("%06.2f", gmem.bpm)
-            highlight_bpm_digit_rect := sdl3.FRect{}
-            font_scale := font_size / gmem.fonts[1].font_line_height
-            bpm_int_part_str := fmt.tprintf("%d", int(gmem.bpm))
-            nb_int_digits := len(bpm_int_part_str)
-            bpm_char_index := nb_int_digits - 1 - gmem.selected_bpm_digit
-
-            if bpm_char_index >= 3 {
-                bpm_char_index += 1 // account for the '.'
-            }
-
-            highlight_rect := sdl3.FRect{}
-            xpos2 : f32 = 0
-            for i in 0..<len(bpm_text) {
-                if i32(bpm_text[i]) >= TTF_CHAR_AT_START && i32(bpm_text[i]) < TTF_CHAR_AT_START + TTF_CHAR_AMOUNT + 1 {
-                    info := gmem.fonts[1].font_packed_chars[i32(bpm_text[i]) - TTF_CHAR_AT_START]
-                    src := sdl3.FRect{f32(info.x0), f32(info.y0), f32(info.x1) - f32(info.x0), f32(info.y1) - f32(info.y0)}
-                    highlight_rect = sdl3.FRect{
-                        xpos2 + f32(info.xoff) * font_scale,
-                        (ypos + f32(info.yoff) * font_scale) + font_size,
-                        f32(info.x1 - info.x0) * font_scale,
-                        f32(info.y1 - info.y0) * font_scale,
-                    }
-
-                    xpos2 += f32(info.xadvance) * font_scale
-                    if i == bpm_char_index {
-                        break
-                    }
-                }
-            }
-
-            bpm_label := "bpm: "
-            render_text_length : f32 = 0
-            for i in 0..<len(bpm_label) {
-                if i32(bpm_label[i]) >= TTF_CHAR_AT_START && i32(bpm_label[i]) < TTF_CHAR_AT_START + TTF_CHAR_AMOUNT + 1 {
-                    info := gmem.fonts[1].font_packed_chars[i32(bpm_label[i]) - TTF_CHAR_AT_START]
-                    src := sdl3.FRect{f32(info.x0), f32(info.y0), f32(info.x1) - f32(info.x0), f32(info.y1) - f32(info.y0)}
-                    render_text_length += f32(info.xadvance) * font_scale
-                }
-            }
-
-            highlight_rect.x += render_text_length + xpos
-            highlight_rect.x -= 1
-            highlight_rect.y -= 1
-            highlight_rect.w += 2
-            highlight_rect.h += 2
-
-            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
-            sdl3.RenderFillRect(gmem.sdl_renderer, &highlight_rect)
-        }
+    is_bpm_modify_button_held := input_app_keys_is_down[.B]
+    if is_bpm_modify_button_held {
+        render_highlight_digit_f32(gmem.bpm, xpos, ypos, font_size, gmem.fonts[1], "bpm: ", 6, 2, gmem.selected_bpm_digit)
     }
-
 
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "bpm: %06.2f", gmem.bpm)
     ypos += font_size * line_spacing_scale
 
-    {
-        is_offset_modify_button_held := input_app_keys_is_down[.O]
-        if is_offset_modify_button_held {
-            offset_text := fmt.tprintf("%07.3f", gmem.offset)
-            highlight_offset_digit_rect := sdl3.FRect{}
-            font_scale := font_size / gmem.fonts[1].font_line_height
-            offset_char_index := gmem.selected_offset_digit
-
-            if offset_char_index >= 3 {
-                offset_char_index += 1 // account for the '.'
-            }
-
-            highlight_rect := sdl3.FRect{}
-            xpos2 : f32 = 0
-            for i in 0..<len(offset_text) {
-                if i32(offset_text[i]) >= TTF_CHAR_AT_START && i32(offset_text[i]) < TTF_CHAR_AT_START + TTF_CHAR_AMOUNT + 1 {
-                    info := gmem.fonts[1].font_packed_chars[i32(offset_text[i]) - TTF_CHAR_AT_START]
-                    src := sdl3.FRect{f32(info.x0), f32(info.y0), f32(info.x1) - f32(info.x0), f32(info.y1) - f32(info.y0)}
-                    highlight_rect = sdl3.FRect{
-                        xpos2 + f32(info.xoff) * font_scale,
-                        (ypos + f32(info.yoff) * font_scale) + font_size,
-                        f32(info.x1 - info.x0) * font_scale,
-                        f32(info.y1 - info.y0) * font_scale,
-                    }
-
-                    xpos2 += f32(info.xadvance) * font_scale
-                    if i == offset_char_index {
-                        break
-                    }
-                }
-            }
-
-            offset_label := "offset: "
-            render_text_length : f32 = 0
-            for i in 0..<len(offset_label) {
-                if i32(offset_label[i]) >= TTF_CHAR_AT_START && i32(offset_label[i]) < TTF_CHAR_AT_START + TTF_CHAR_AMOUNT + 1 {
-                    info := gmem.fonts[1].font_packed_chars[i32(offset_label[i]) - TTF_CHAR_AT_START]
-                    src := sdl3.FRect{f32(info.x0), f32(info.y0), f32(info.x1) - f32(info.x0), f32(info.y1) - f32(info.y0)}
-                    render_text_length += f32(info.xadvance) * font_scale
-                }
-            }
-
-            highlight_rect.x += render_text_length + xpos
-            highlight_rect.x -= 1
-            highlight_rect.y -= 1
-            highlight_rect.w += 2
-            highlight_rect.h += 2
-
-            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
-            sdl3.RenderFillRect(gmem.sdl_renderer, &highlight_rect)
-        }
+    is_offset_modify_button_held := input_app_keys_is_down[.O]
+    if is_offset_modify_button_held {
+        render_highlight_digit_f32(gmem.offset, xpos, ypos, font_size, gmem.fonts[1], "offset: ", 7, 3, gmem.selected_offset_digit)
     }
 
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "offset: %07.3f", gmem.offset)
@@ -1010,16 +970,20 @@ game_update :: proc () {
 
     curr_beat := i32( gmem.offset + (curr_cursor_seconds * (gmem.bpm / seconds_in_minute) ) )
     total_beats := i32(gmem.offset + (length * (gmem.bpm / seconds_in_minute)) )
+
     render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 50, 50, 50, 255, gmem.fonts[1], "beats: %d / %d", curr_beat, total_beats)
     ypos += font_size * line_spacing_scale
 
     beats_in_measure : i32 : 4
     curr_measure := curr_beat / beats_in_measure
-    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "measure: %d", curr_measure)
+    total_measures := total_beats / 4
+
+    render_text_tprintf(gmem.sdl_renderer, xpos, ypos, font_size, 75, 75, 75, 255, gmem.fonts[1], "measure: %d / %d", curr_measure, total_measures)
     ypos += font_size * line_spacing_scale
 
     render_text(gmem.sdl_renderer, xpos, ypos, font_size, 200, 200, 0, 255, gmem.fonts[1], "metronome: ")
     beat_in_measure := curr_beat %% beats_in_measure
+
     for i in 0..<beat_in_measure+1 {
         spacing : f32 = 10
         size := font_size
@@ -1086,12 +1050,22 @@ game_update :: proc () {
         sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,255,255,255)
         sdl3.RenderFillRect(gmem.sdl_renderer, &future_progress_bar_rectangle)
 
+        for measure in 0..<total_measures {
+            measure_duration := quarter_note_duration*4 // only 4/4
+            measure_start_ts := gmem.offset + (f32(measure) * measure_duration)
+            measure_start_progress := measure_start_ts / sound_length_seconds
+            measure_start_x := xpos + padding_for_progress_bar + (progress_bar_width * measure_start_progress)
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 150,150,150,255)
+            sdl3.RenderLine(gmem.sdl_renderer, measure_start_x, ypos, measure_start_x, ypos + progress_bar_height)
+        }
+
         playhead_sprite_dst := sdl3.FRect{
             future_progress_xpos - (media_player_buttons_sprite_width/2.0),
             ypos - 3,
             media_player_buttons_sprite_width,
             media_player_buttons_sprite_height,
         }
+
         playhead_sprite_src := sprite_atlas_src_rect_clip(gmem.animated_sprite_atlas, i32(SpriteRow.playhead), animated_sprites[.playhead].curr_frame, media_player_buttons_sprite_width, media_player_buttons_sprite_height)
         sdl3.RenderTexture(gmem.sdl_renderer, gmem.animated_sprite_atlas, &playhead_sprite_src, &playhead_sprite_dst)
 
@@ -1286,6 +1260,20 @@ game_update :: proc () {
             sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,255,255,255)
             sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, xpos, y2)
         }
+
+        sound_length_seconds : f32
+        ma.sound_get_length_in_seconds(&gmem.ma_sound, &sound_length_seconds)
+
+        // TODO(johnb) need to use frames per waveform sample peak to then get the nb of seconds per peak
+        // we can get the current seconds start at the waveform sample being shown. The use that probably
+        for measure in 0..<total_measures {
+            measure_duration := quarter_note_duration*4 // only 4/4
+            measure_start_ts := gmem.offset + (f32(measure) * measure_duration)
+            measure_start_progress := measure_start_ts / sound_length_seconds
+            measure_start_x := (panel_layout_col_width * measure_start_progress)
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 150,150,150,255)
+            sdl3.RenderLine(gmem.sdl_renderer, measure_start_x, panel_layout_at_y, measure_start_x, panel_layout_at_y + panel_layout_row_height)
+        }
     }
 
     sdl3.SetRenderDrawColor(gmem.sdl_renderer, 150,150,150,255)
@@ -1307,6 +1295,13 @@ game_update :: proc () {
         ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
         total_pcm_frames: u64
         ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
+
+        nb_seconds_to_show := 30.0
+        current_cursor_seconds_ts : f32
+        ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &current_cursor_seconds_ts)
+
+        nb_seconds_per_peak_bucket : f32 = gmem.frames_per_waveform_peak * gmem.ma_engine.sampleRate * 2 // 2 channels
+
         current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
         current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
         end_waveform_index := current_waveform_index + u64(nb_waveform_indices_in_visualization)
