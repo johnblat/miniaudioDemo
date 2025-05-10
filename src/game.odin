@@ -252,7 +252,7 @@ game_init :: proc () {
         context.allocator = mem.tracking_allocator(&track)
     }
 
-    default_audio_filename : cstring = "C:\\Users\\johnb\\Music\\Modest Mouse - We Were Dead Before The Ship Even Sank\\Modest Mouse - We Were Dead Before The Ship Even Sank - 02 Dashboard.flac"
+    default_audio_filename : cstring = "C:\\Users\\johnb\\Music\\Imogen Heap - Speak For Yourself (Deluxe Version)\\Imogen Heap - Speak For Yourself (Deluxe Version) - 10 I Am In Love With You.wav"
     { // populate the direcotry array
         current_filepath_str := strings.clone_from_cstring(default_audio_filename, context.temp_allocator)
         directory_of_selected_song := filepath.dir(current_filepath_str, context.temp_allocator)
@@ -605,6 +605,7 @@ power_of_ten_digit_adjust :: proc (val: ^f32, power_of_ten : ^int, hi, lo : int,
         val^ -= amount_to_change
     }
 
+    // this will look like 9.99 or 999.99. You get the idea.
     max_val := f32(math.pow(10, f32(hi+1)) - 1) + f32(math.pow(10, f32(math.abs(lo))) - 1) / math.pow(10, f32(math.abs(lo)))
 
     val^ = math.clamp(val^, 0, max_val)
@@ -1238,52 +1239,6 @@ game_update :: proc () {
     panel_layout_row_height = 120.0
 
 
-    { // draw waveform region absolute amplitude
-        wave_max_height : f32 = panel_layout_row_height
-
-        y_midpoint := panel_layout_at_y
-
-        current_pcm_frame: u64
-        ma.sound_get_cursor_in_pcm_frames(&gmem.ma_sound, &current_pcm_frame)
-        total_pcm_frames: u64
-        ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
-        current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
-        current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
-        end_waveform_range := current_waveform_index + u64(panel_layout_col_width)
-        end_waveform_range = min(len(gmem.waveform_samples), end_waveform_range)
-
-        for peak, offset in gmem.waveform_samples[current_waveform_index:end_waveform_range] {
-            peak_abs := math.abs(peak)
-            xpos := f32(i32(offset))
-            y1 := y_midpoint + (wave_max_height / 2.0 - peak_abs * (wave_max_height/2.0))
-            y2 := y_midpoint + (wave_max_height/2) + (peak_abs * (wave_max_height/2))
-            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 0,255,255,255)
-            sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, xpos, y2)
-        }
-
-        sound_length_seconds : f32
-        ma.sound_get_length_in_seconds(&gmem.ma_sound, &sound_length_seconds)
-
-        // TODO(johnb) need to use frames per waveform sample peak to then get the nb of seconds per peak
-        // we can get the current seconds start at the waveform sample being shown. The use that probably
-        for measure in 0..<total_measures {
-            measure_duration := quarter_note_duration*4 // only 4/4
-            measure_start_ts := gmem.offset + (f32(measure) * measure_duration)
-            measure_start_progress := measure_start_ts / sound_length_seconds
-            measure_start_x := (panel_layout_col_width * measure_start_progress)
-            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 150,150,150,255)
-            sdl3.RenderLine(gmem.sdl_renderer, measure_start_x, panel_layout_at_y, measure_start_x, panel_layout_at_y + panel_layout_row_height)
-        }
-    }
-
-    sdl3.SetRenderDrawColor(gmem.sdl_renderer, 150,150,150,255)
-    r2 := sdl3.FRect{panel_layout_at_x, panel_layout_at_y, panel_layout_col_width, panel_layout_row_height}
-    sdl3.RenderRect(gmem.sdl_renderer, &r2)
-
-    // next panel row
-    panel_layout_at_x = 0
-    panel_layout_at_y += panel_layout_row_height
-
     { // draw full waveform non-absolute
         waveform_width : i32 = i32(panel_layout_col_width)
         wave_max_height : f32 = panel_layout_row_height
@@ -1296,20 +1251,29 @@ game_update :: proc () {
         total_pcm_frames: u64
         ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
 
-        nb_seconds_to_show := 30.0
+        nb_seconds_to_display : f32 = 15.0
         current_cursor_seconds_ts : f32
         ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &current_cursor_seconds_ts)
 
-        nb_seconds_per_peak_bucket : f32 = gmem.frames_per_waveform_peak * gmem.ma_engine.sampleRate * 2 // 2 channels
+        nb_channels := ma.engine_get_channels(&gmem.ma_engine)
+
+        nb_samples_per_second :=  u64(gmem.ma_engine.sampleRate) * u64(nb_channels)
+        nb_frames_per_second := gmem.ma_engine.sampleRate
+        nb_seconds_per_peak_bucket : f32 = f32(gmem.frames_per_waveform_peak) /  f32(nb_frames_per_second)  
+        peak_bucket_duration_in_seconds := nb_seconds_per_peak_bucket
+
+        nb_peak_buckets_to_display := nb_seconds_to_display / peak_bucket_duration_in_seconds
+
+        peak_bucket_spacing := panel_layout_col_width / nb_peak_buckets_to_display
 
         current_waveform_index := (current_pcm_frame) / (gmem.frames_per_waveform_peak )
         current_waveform_index = clamp(current_waveform_index, 0, len(gmem.waveform_samples))
-        end_waveform_index := current_waveform_index + u64(nb_waveform_indices_in_visualization)
+        end_waveform_index := current_waveform_index + u64(nb_peak_buckets_to_display)
         end_waveform_index = clamp(end_waveform_index, 0, len(gmem.waveform_samples))
 
         for i, offset in current_waveform_index..<end_waveform_index {
-            xpos := f32(i32(offset))
-            next_xpos :=  f32(i32(offset+1))
+            xpos := f32(i32(offset))*peak_bucket_spacing
+            next_xpos :=  f32(i32(offset+1))*peak_bucket_spacing
             peak := gmem.waveform_samples[i]
             if i + 1 >= len(gmem.waveform_samples) {
                 break // gtfo
@@ -1320,6 +1284,24 @@ game_update :: proc () {
 
             sdl3.SetRenderDrawColor(gmem.sdl_renderer, 255,150,255,255)
             sdl3.RenderLine(gmem.sdl_renderer, xpos, y1, next_xpos, next_y2)
+        }
+
+        measure_duration := quarter_note_duration*4 // only 4/4
+        next_measure_ts := f32(curr_measure + 1) * measure_duration
+        time_until_next_measure := next_measure_ts - curr_cursor_seconds
+        space_before_next_measure := (panel_layout_col_width / nb_seconds_to_display) * time_until_next_measure
+        nb_measures_to_display := nb_seconds_to_display / measure_duration
+        end_measure := i32(f32(curr_measure) + (nb_measures_to_display))
+        end_measure = clamp(end_measure, 0, total_measures)
+        measure_spacing := panel_layout_col_width / nb_measures_to_display
+
+        for i, offset in curr_measure..<end_measure+1 {
+            xpos := space_before_next_measure + f32(i32(offset))*measure_spacing
+            if xpos > panel_layout_at_x + panel_layout_col_width {
+                break
+            }
+            sdl3.SetRenderDrawColor(gmem.sdl_renderer, 200,200,200,255)
+            sdl3.RenderLine(gmem.sdl_renderer, xpos, panel_layout_at_y, xpos, panel_layout_at_y + panel_layout_row_height)
         }
     }
 
