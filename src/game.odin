@@ -21,6 +21,22 @@ breakpoint :: intrinsics.debug_trap
 
 should_run := true
 
+rectangle_intersects_point :: proc(r_x, r_y, r_w, r_h, p_x, p_y: f32) -> bool {
+    if p_x < r_x {
+        return false
+    } 
+    if p_y < r_y {
+        return false
+    } 
+    if p_x > r_x + r_w {
+        return false
+    } 
+    if p_y > r_y + r_h {
+        return false
+    } 
+    return true
+}
+
 Game_Memory :: struct {
     ma_engine  : ma.engine,
     ma_sound   : ma.sound,
@@ -72,7 +88,7 @@ game_memory_size :: proc() -> int {
 
 Input_State :: enum {up, pressed, down, released}
 Input_Command :: enum {play_toggle, force_hot_reload, force_build_and_hot_reload, force_restart, restart_sound}
-Input_App_Key :: enum {Enter, LeftShift, RightShift, LeftCtrl, F5, F6, F7, B, V, S, O}
+Input_App_Key :: enum {Enter, LeftShift, RightShift, LeftCtrl, F5, F6, F7, F11, B, V, S, O}
 
 TTF_CHAR_AT_START : i32 :  32
 TTF_CHAR_AMOUNT : i32 : 95
@@ -524,6 +540,8 @@ set_input_state :: proc(scancode : sdl3.Scancode, val : bool) {
     }
     else if scancode == .O {
         input_app_keys_is_down[.O] = val
+    } else if scancode == .F11 {
+        input_app_keys_is_down[.F11] = val
     }
 }
 
@@ -671,6 +689,8 @@ game_update :: proc () {
     @(static) should_draw_table        := false
     @(static) should_draw_weird_visual := false
     @(static) modify_bpm_mode          := false
+
+    mouse_scroll_y : f32
 
 
     req_go_to_next_track := false
@@ -847,6 +867,9 @@ game_update :: proc () {
         {
             set_input_state(sdl_event.key.scancode, false)
         }
+        else if sdl_event.type == .MOUSE_WHEEL {
+            mouse_scroll_y = sdl_event.wheel.y
+        }
 
         if sdl_event.type == .WINDOW_CLOSE_REQUESTED {
             should_run = false
@@ -863,6 +886,16 @@ game_update :: proc () {
             ma.sound_stop(&gmem.ma_sound)
         } else {
             ma.sound_start(&gmem.ma_sound)
+        }
+    }
+
+    is_fullscreen_key_just_pressed := input_app_keys_is_down[.F11] == true && prev_input_app_keys_is_down[.F11] == false
+    if is_fullscreen_key_just_pressed {
+        window_flags := sdl3.GetWindowFlags(gmem.sdl_window)
+        if .FULLSCREEN in window_flags {
+            sdl3.SetWindowFullscreen(gmem.sdl_window, false)
+        } else {
+            sdl3.SetWindowFullscreen(gmem.sdl_window, true)
         }
     }
 
@@ -1240,6 +1273,19 @@ game_update :: proc () {
 
 
     { // draw full waveform non-absolute
+        @(static) nb_seconds_to_display : f32 = 15.0
+        mouse_x, mouse_y: f32
+        _ = sdl3.GetMouseState(&mouse_x, &mouse_y)
+        
+        can_zoom_seconds_to_display := rectangle_intersects_point(panel_layout_at_x, panel_layout_at_y, panel_layout_col_width, panel_layout_row_height, mouse_x, mouse_y)
+        if can_zoom_seconds_to_display {
+            if mouse_scroll_y > 0 {
+                nb_seconds_to_display += 0.5
+            } else if mouse_scroll_y < 0 {
+                nb_seconds_to_display -= 0.5
+            }
+        }
+
         waveform_width : i32 = i32(panel_layout_col_width)
         wave_max_height : f32 = panel_layout_row_height
 
@@ -1251,7 +1297,6 @@ game_update :: proc () {
         total_pcm_frames: u64
         ma.sound_get_length_in_pcm_frames(&gmem.ma_sound, &total_pcm_frames)
 
-        nb_seconds_to_display : f32 = 15.0
         current_cursor_seconds_ts : f32
         ma.sound_get_cursor_in_seconds(&gmem.ma_sound, &current_cursor_seconds_ts)
 
