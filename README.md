@@ -17,8 +17,6 @@ This repo demonstrates the following things:
 - Using the file dialogue popup to select a file with filters
 - Hot reloading
   
-Please feel free to use this in any way. If you find something particularly useful, a credit would be appreciated but not necesarry.
-
 This was only tested on Windows.
 
 ## What's next to do?
